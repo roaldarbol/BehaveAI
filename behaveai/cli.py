@@ -32,7 +32,7 @@ DEFAULT_PROJECTS_DIR = _default_projects_dir()
 def cli(ctx, project, projects_dir):
     """BehaveAI - animal tracking and behaviour classification."""
     if ctx.invoked_subcommand is None:
-        from behaveai.BehaveAI import launch
+        from behaveai.launcher import launch
         launch(
             project_path=project,
             projects_dir=Path(projects_dir) if projects_dir else DEFAULT_PROJECTS_DIR,

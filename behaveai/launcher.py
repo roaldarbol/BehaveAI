@@ -430,10 +430,9 @@ secondary_static_hotkeys = 0
 
 def launch(project_path=None, projects_dir=None):
     from pathlib import Path
-    from platformdirs import user_data_dir
 
     if projects_dir is None:
-        projects_dir = Path(user_data_dir("BehaveAI")) / "projects"
+        projects_dir = Path.home() / "BehaveAI" / "projects"
 
     root = tk.Tk()
     app = ScriptRunnerApp(root, projects_dir=projects_dir, initial_project=project_path)
