@@ -6,18 +6,40 @@ from pathlib import Path
 
 def _default_projects_dir() -> Path:
     exe = Path(sys.executable)
-    # Pixi environment: find .pixi in path parts
+    home = Path.home()
+
+    # Pixi environment: .pixi appears in the executable path
     try:
         pixi_idx = exe.parts.index(".pixi")
-        return Path(*exe.parts[:pixi_idx]) / "behaveai_projects"
+        pixi_parent = Path(*exe.parts[:pixi_idx])
+        # Global install: .pixi is directly under home (~/.pixi/envs/<name>/...)
+        if pixi_parent == home:
+            return home / "BehaveAI" / "projects"
+        # Project install: .pixi is inside a project directory
+        return pixi_parent / "behaveai_projects"
     except ValueError:
         pass
-    # Standard venv: check for pyvenv.cfg two levels up
+
+    # uv tool install: ~/.local/share/uv/tools (Linux/Mac)
+    # or %APPDATA%\uv\tools (Windows)
+    try:
+        parts_lower = [p.lower() for p in exe.parts]
+        uv_idx = next(
+            i for i, p in enumerate(parts_lower) if p == "tools"
+            and i > 0 and parts_lower[i - 1] == "uv"
+        )
+        # tools/<name>/... -> global install
+        return home / "BehaveAI" / "projects"
+    except StopIteration:
+        pass
+
+    # Standard venv: pyvenv.cfg two levels up from the executable
     venv_root = exe.parent.parent
     if (venv_root / "pyvenv.cfg").exists():
         return venv_root.parent / "behaveai_projects"
-    # Global install fallback
-    return Path.home() / "BehaveAI" / "projects"
+
+    # Fallback
+    return home / "BehaveAI" / "projects"
 
 
 DEFAULT_PROJECTS_DIR = _default_projects_dir()
