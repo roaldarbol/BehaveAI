@@ -103,6 +103,7 @@ def run(
 def motion(
     input: Path = typer.Argument(..., exists=True, help="Single video file or directory of videos."),
     output: Optional[Path] = typer.Argument(None, help="Destination path (auto-generated if not provided)."),
+    output_opt: Optional[Path] = typer.Option(None, "--output", help="Destination path (alias for the positional OUTPUT argument)."),
     strategy: MotionStrategy = typer.Option(MotionStrategy.exponential, show_default=True, help="Frame accumulation strategy."),
     exp_a: float = typer.Option(0.5, "--exp-a", show_default=True, help="Exponential decay for the green (medium-term) channel."),
     exp_b: float = typer.Option(0.8, "--exp-b", show_default=True, help="Exponential decay for the red (older) channel."),
@@ -127,11 +128,17 @@ def motion(
     Examples:
       behaveai motion input.mp4
       behaveai motion input.mp4 output.mp4
+      behaveai motion input.mp4 output.mp4
+      behaveai motion input.mp4 --output output.mp4
       behaveai motion input.mp4 output.mp4 --strategy exponential --exp-a 0.5
       behaveai motion videos/ --chromatic-tail-only
       behaveai motion videos/ motion_videos/
     """
     from behaveai.motion import process_motion_batch
+
+    if output is not None and output_opt is not None:
+        raise typer.BadParameter("Cannot specify both positional OUTPUT and --output.", param_hint="OUTPUT / --output")
+    output = output or output_opt
 
     # Derive default output path if not given
     if output is None:
