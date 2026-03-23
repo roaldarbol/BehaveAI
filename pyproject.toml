@@ -20,11 +20,11 @@ dependencies = [
     "opencv-python",
     "torch",
     "torchvision",
-    "click"
+    "typer"
 ]
 
 [project.scripts]
-behaveai = "behaveai.cli:cli"
+behaveai = "behaveai.cli:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["behaveai"]
