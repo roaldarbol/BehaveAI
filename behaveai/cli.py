@@ -140,6 +140,10 @@ def motion(
         raise typer.BadParameter("Cannot specify both positional OUTPUT and --output.", param_hint="OUTPUT / --output")
     output = output or output_opt
 
+    # If input is a file but output is an existing directory, place the auto-named file inside it
+    if output is not None and input.is_file() and output.is_dir():
+        output = output / (input.stem + "_motion" + input.suffix)
+
     # Derive default output path if not given
     if output is None:
         p = input
@@ -147,7 +151,8 @@ def motion(
             output = p.parent / (p.name + "_motion")
         else:
             output = p.parent / (p.stem + "_motion" + p.suffix)
-        typer.echo(f"Output: {output}")
+
+    typer.echo(f"Output: {output}")
 
     try:
         multipliers = tuple(float(x) for x in rgb_multipliers.split(","))
