@@ -3,6 +3,23 @@ import typer
 from pathlib import Path
 from typing import Optional
 from enum import Enum
+from loguru import logger
+
+# Remove loguru's default handler; the main() callback adds one based on --debug
+logger.remove()
+
+_LOG_FORMAT_NORMAL = (
+    "<cyan>{time:HH:mm:ss}</cyan> | "
+    "<level>{level: <8}</level> | "
+    "{message}"
+)
+
+_LOG_FORMAT_DEBUG = (
+    "<cyan>{time:HH:mm:ss.SSS}</cyan> | "
+    "<level>{level: <8}</level> | "
+    "<dim>{name}:{line}</dim> | "
+    "{message}"
+)
 
 app = typer.Typer(help="BehaveAI - animal tracking and behaviour classification.")
 
@@ -10,6 +27,12 @@ app = typer.Typer(help="BehaveAI - animal tracking and behaviour classification.
 class MotionStrategy(str, Enum):
     exponential = "exponential"
     sequential = "sequential"
+
+
+class DeviceChoice(str, Enum):
+    auto = "auto"
+    cpu  = "cpu"
+    cuda = "cuda"
 
 
 def _default_projects_dir() -> Path:
@@ -66,8 +89,14 @@ def main(
         None,
         help="Override the default projects directory.",
     ),
+    debug: bool = typer.Option(False, "--debug", help="Enable debug logging.", is_eager=True),
 ):
     """BehaveAI - animal tracking and behaviour classification."""
+    if debug:
+        logger.add(sys.stderr, level="DEBUG", format=_LOG_FORMAT_DEBUG, colorize=True)
+    else:
+        logger.add(sys.stderr, level="INFO", format=_LOG_FORMAT_NORMAL, colorize=True)
+
     if ctx.invoked_subcommand is None:
         from behaveai.launcher import launch
         launch(
@@ -115,6 +144,7 @@ def motion(
     motion_threshold: int = typer.Option(0, "--motion-threshold", show_default=True, help="Brightness offset applied to output (negative darkens low-motion areas)."),
     compress: bool = typer.Option(False, help="Re-encode the output with FFmpeg H.264 after writing (requires ffmpeg in PATH)."),
     crf: int = typer.Option(23, "--crf", show_default=True, help="H.264 quality for --compress (lower = better quality, 18-28 is typical)."),
+    device: DeviceChoice = typer.Option(DeviceChoice.auto, "--device", show_default=True, help="Processing device: auto detects CUDA, falls back to CPU."),
 ):
     """Convert a video (or folder of videos) to a motion-enhanced output.
 
@@ -152,7 +182,7 @@ def motion(
         else:
             output = p.parent / (p.stem + "_motion" + p.suffix)
 
-    typer.echo(f"Output: {output}")
+    logger.info("Output: {}", output)
 
     try:
         multipliers = tuple(float(x) for x in rgb_multipliers.split(","))
@@ -178,4 +208,50 @@ def motion(
         motion_threshold=motion_threshold,
         compress=compress,
         crf=crf,
+        device=device.value,
     )
+
+
+@app.command("gpu-check")
+def gpu_check():
+    """Show available GPU compute backends and driver info."""
+    import typer
+
+    def ok(msg):  typer.echo(typer.style("  ✓ " + msg, fg="green"))
+    def no(msg):  typer.echo(typer.style("  ✗ " + msg, fg="red", dim=True))
+    def info(msg): typer.echo(f"    {msg}")
+
+    typer.echo(typer.style("\nGPU / compute backend check", bold=True))
+
+    # --- CUDA via PyTorch ---
+    typer.echo(typer.style("\nCUDA (PyTorch)", bold=True))
+    try:
+        import torch
+        ok(f"PyTorch {torch.__version__}")
+        if torch.cuda.is_available():
+            ok(f"CUDA available  (driver: {torch.version.cuda})")
+            for i in range(torch.cuda.device_count()):
+                p = torch.cuda.get_device_properties(i)
+                info(f"[{i}] {p.name}  {p.total_memory // 1024**2} MB  "
+                     f"compute {p.major}.{p.minor}")
+        else:
+            no("CUDA not available")
+            info("torch.cuda.is_available() returned False")
+    except ImportError:
+        no("PyTorch not installed")
+
+    # --- TorchCodec ---
+    typer.echo(typer.style("\nTorchCodec (motion GPU decode)", bold=True))
+    try:
+        import torchcodec
+        ok(f"TorchCodec {torchcodec.__version__}")
+        try:
+            from torchcodec.decoders import set_cuda_backend
+            ok("Beta CUDA backend available (~3x faster NVDEC)")
+        except (ImportError, RuntimeError):
+            info("Beta CUDA backend not found (set_cuda_backend missing) — using default")
+    except (ImportError, RuntimeError) as e:
+        no(f"TorchCodec not available: {e.args[0].splitlines()[0] if e.args else e}")
+        info("On Windows, install via: pixi run behaveai  (conda-forge build includes FFmpeg)")
+
+    typer.echo("")

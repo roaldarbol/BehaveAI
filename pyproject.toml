@@ -20,7 +20,9 @@ dependencies = [
     "opencv-python",
     "torch",
     "torchvision",
-    "typer"
+    "typer",
+    "loguru",
+    "torchcodec"
 ]
 
 [project.scripts]
@@ -28,3 +30,49 @@ behaveai = "behaveai.cli:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["behaveai"]
+
+# ---------------------------------------------------------------------------
+# uv: use CUDA PyTorch wheels for local development.
+# The conda package manages its own torch dependency separately.
+# cu128 required for Blackwell GPUs (sm_120, RTX 5090 etc.); cu126 only reaches sm_90.
+# ---------------------------------------------------------------------------
+[tool.uv.sources]
+torch = [{ index = "pytorch-cuda" }]
+torchvision = [{ index = "pytorch-cuda" }]
+
+[[tool.uv.index]]
+name = "pytorch-cuda"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+# ---------------------------------------------------------------------------
+# pixi: conda-forge environment for development with GPU-accelerated OpenCV
+# (cv2.cudacodec). System requirements tell pixi the host has CUDA 12.9 so it
+# selects CUDA-enabled builds (pytorch, py-opencv) from conda-forge.
+# ---------------------------------------------------------------------------
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["win-64"]
+
+[tool.pixi.system-requirements]
+cuda = "12.9"
+
+[tool.pixi.dependencies]
+python = ">=3.9,<3.13"
+numpy = "*"
+pillow = "*"
+scipy = "*"
+tqdm = "*"
+pyyaml = "*"
+py-opencv = "*"
+loguru = "*"
+typer = "*"
+pytorch = "*"
+torchvision = "*"
+torchcodec = {version = "*", build = "*cuda*"}
+
+[tool.pixi.pypi-dependencies]
+# ultralytics is more reliably up-to-date on PyPI
+ultralytics = "*"
+# install the project itself as editable so `behaveai` entry point works
+pybehaveai = {path = ".", editable = true}
