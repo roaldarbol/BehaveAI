@@ -157,13 +157,31 @@ def _ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
-def _compress_with_ffmpeg(path: str, crf: int = 23) -> None:
-    """Re-encode a video with FFmpeg H.264 in-place, replacing the original."""
+def _nvenc_available() -> bool:
+    """Return True if FFmpeg was built with hevc_nvenc support."""
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-encoders"],
+            capture_output=True, check=True,
+        )
+        return b"hevc_nvenc" in result.stdout
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+
+def _compress_with_ffmpeg(path: str, crf: int | None = None) -> None:
+    """Re-encode a video with FFmpeg H.265 (GPU via NVENC if available, else CPU) in-place."""
     tmp = path + ".tmp_compress.mp4"
+    if _nvenc_available():
+        logger.info("NVENC detected — using GPU encoding (hevc_nvenc)")
+        codec_args = ["-c:v", "hevc_nvenc", "-preset", "p7", "-cq", str(crf if crf is not None else 28)]
+    else:
+        logger.info("NVENC not available — using CPU encoding (libx265)")
+        codec_args = ["-c:v", "libx265", "-crf", str(crf if crf is not None else 26), "-preset", "medium"]
     cmd = [
         "ffmpeg", "-y", "-i", path,
-        "-vcodec", "libx264", "-crf", str(crf),
-        "-preset", "fast",
+        *codec_args,
+        "-c:a", "copy",
         "-movflags", "+faststart",
         tmp,
     ]
@@ -562,7 +580,7 @@ def process_motion_video(
     frame_skip: int = 0,
     motion_threshold: int = 0,
     compress: bool = False,
-    crf: int = 23,
+    crf: int | None = None,
     device: str = "auto",
 ) -> None:
     """

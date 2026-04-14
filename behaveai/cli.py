@@ -142,8 +142,8 @@ def motion(
     scale_factor: float = typer.Option(1.0, "--scale-factor", show_default=True, help="Resize factor applied to each frame before processing."),
     frame_skip: int = typer.Option(0, "--frame-skip", show_default=True, help="Number of frames to skip between processed frames."),
     motion_threshold: int = typer.Option(0, "--motion-threshold", show_default=True, help="Brightness offset applied to output (negative darkens low-motion areas)."),
-    compress: bool = typer.Option(False, help="Re-encode the output with FFmpeg H.264 after writing (requires ffmpeg in PATH)."),
-    crf: int = typer.Option(23, "--crf", show_default=True, help="H.264 quality for --compress (lower = better quality, 18-28 is typical)."),
+    compress: bool = typer.Option(False, help="Re-encode the output with FFmpeg H.265 after writing (requires ffmpeg in PATH). Uses NVENC GPU encoding if available, otherwise libx265."),
+    crf: Optional[int] = typer.Option(None, "--crf", help="Quality for --compress (lower = better). Defaults to 28 for NVENC, 26 for libx265."),
     device: DeviceChoice = typer.Option(DeviceChoice.auto, "--device", show_default=True, help="Processing device: auto detects CUDA, falls back to CPU."),
 ):
     """Convert a video (or folder of videos) to a motion-enhanced output.
