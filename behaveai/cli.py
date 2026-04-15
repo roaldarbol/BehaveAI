@@ -145,6 +145,7 @@ def motion(
     compress: bool = typer.Option(False, help="Re-encode the output with FFmpeg H.265 after writing (requires ffmpeg in PATH). Uses NVENC GPU encoding if available, otherwise libx265."),
     crf: Optional[int] = typer.Option(None, "--crf", help="Quality for --compress (lower = better). Defaults to 28 for NVENC, 26 for libx265."),
     device: DeviceChoice = typer.Option(DeviceChoice.auto, "--device", show_default=True, help="Processing device: auto detects CUDA, falls back to CPU."),
+    debug: bool = typer.Option(False, "--debug", help="Enable debug logging.", is_eager=True),
 ):
     """Convert a video (or folder of videos) to a motion-enhanced output.
 
@@ -165,6 +166,11 @@ def motion(
       behaveai motion videos/ motion_videos/
     """
     from behaveai.motion import process_motion_batch
+
+    if debug:
+        # The root callback already installed an INFO handler; replace it with DEBUG.
+        logger.remove()
+        logger.add(sys.stderr, level="DEBUG", format=_LOG_FORMAT_DEBUG, colorize=True)
 
     if output is not None and output_opt is not None:
         raise typer.BadParameter("Cannot specify both positional OUTPUT and --output.", param_hint="OUTPUT / --output")
