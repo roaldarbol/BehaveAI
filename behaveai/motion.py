@@ -169,6 +169,110 @@ def _nvenc_available() -> bool:
         return False
 
 
+class _FFmpegPipeWriter:
+    """
+    Drop-in replacement for cv2.VideoWriter that pipes raw BGR24 frames to FFmpeg.
+
+    For GPU paths this eliminates the large intermediate mp4v file and the
+    separate --compress step: frames are encoded directly to H.265 (NVENC when
+    available, libx265 otherwise) as they are produced.
+
+    The writer is intentionally minimal — it mirrors the write() / release()
+    interface used by cv2.VideoWriter so it can be passed into the same
+    processing functions without changes.
+    """
+
+    def __init__(self, output_path: str, w: int, h: int, fps: float, crf: int | None = None):
+        if _nvenc_available():
+            quality = crf if crf is not None else 28
+            vcodec_args = ["-c:v", "hevc_nvenc", "-preset", "p7", "-cq", str(quality)]
+            logger.debug("FFmpegPipeWriter: hevc_nvenc  cq={}", quality)
+        else:
+            quality = crf if crf is not None else 26
+            vcodec_args = ["-c:v", "libx265", "-crf", str(quality), "-preset", "medium"]
+            logger.debug("FFmpegPipeWriter: libx265  crf={}", quality)
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "rawvideo", "-pix_fmt", "bgr24",
+            "-s", f"{w}x{h}", "-r", str(fps),
+            "-i", "pipe:0",
+            *vcodec_args,
+            "-movflags", "+faststart",
+            output_path,
+        ]
+        self._stderr_tmp = tempfile.TemporaryFile()
+        self._proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=self._stderr_tmp,
+        )
+
+    def isOpened(self) -> bool:
+        return self._proc.poll() is None
+
+    def write(self, frame: "np.ndarray") -> None:
+        if self._proc.poll() is not None:
+            raise RuntimeError("FFmpeg process exited unexpectedly during encode")
+        self._proc.stdin.write(memoryview(frame))
+
+    def release(self) -> None:
+        if self._proc.stdin:
+            try:
+                self._proc.stdin.close()
+            except BrokenPipeError:
+                pass
+        retcode = self._proc.wait()
+        if retcode != 0:
+            self._stderr_tmp.seek(0)
+            err = self._stderr_tmp.read(4096).decode(errors="replace").strip()
+            logger.warning("FFmpeg pipe exited with code {}: …{}", retcode, err[-200:])
+        self._stderr_tmp.close()
+
+
+# ---------------------------------------------------------------------------
+# Async writer thread
+# ---------------------------------------------------------------------------
+
+def _start_writer_thread(writer, buf_size: int = 4):
+    """
+    Write frames in a background thread, decoupling GPU compute from disk I/O.
+
+    The caller puts (H, W, 3) uint8 numpy frames on the returned queue and a
+    None sentinel when finished.  Any exception raised inside the thread is
+    stored in exc_holder[0] so the caller can re-raise it on the main thread.
+
+    Memory is bounded: the queue holds at most buf_size frames (~11 MB each at
+    2560×1440) and blocks the producer when full, providing natural backpressure.
+    """
+    q: queue.Queue = queue.Queue(maxsize=buf_size)
+    exc_holder: list = [None]
+
+    def _writer() -> None:
+        try:
+            while True:
+                frame = q.get()
+                if frame is None:
+                    logger.debug("Writer thread: sentinel received, stopping")
+                    return
+                writer.write(frame)
+        except Exception as exc:
+            exc_holder[0] = exc
+            logger.debug("Writer thread: exception — {}", exc)
+            # Drain so the producer can unblock from q.put() and exit cleanly
+            while True:
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    break
+
+    t = threading.Thread(target=_writer, daemon=True)
+    t.start()
+    logger.debug("Writer thread started (buf_size={})", buf_size)
+    return q, t, exc_holder
+
+
 def _compress_with_ffmpeg(path: str, crf: int | None = None) -> None:
     """Re-encode a video with FFmpeg H.265 (GPU via NVENC if available, else CPU) in-place."""
     tmp = path + ".tmp_compress.mp4"
@@ -392,13 +496,16 @@ def _process_gpu(
     written     = 0
     start_time  = time.perf_counter()
 
-    q, reader_thread = _start_reader_thread(cap, step)
+    read_q, reader_thread = _start_reader_thread(cap, step)
+    write_q, writer_thread, write_exc = _start_writer_thread(writer)
     logger.debug("GPU processing loop started (device={})", torch_device)
+
+    _t_compute = _t_transfer = _t_queue = 0.0
     interrupted = False
     try:
         while True:
             try:
-                item = q.get(timeout=30)
+                item = read_q.get(timeout=30)
             except queue.Empty:
                 logger.warning("No frame received in 30s after writing {} frames — reader thread may have stalled", written)
                 continue
@@ -407,8 +514,13 @@ def _process_gpu(
                 break
             frame_idx, raw_frame = item
 
+            if write_exc[0] is not None:
+                raise write_exc[0]
+
             if scale_factor != 1.0:
                 raw_frame = cv2.resize(raw_frame, (w, h))
+
+            _t0 = time.perf_counter()
 
             # Upload BGR frame, convert to float32 grayscale on GPU
             gray = _bgr_to_gray_t(
@@ -445,24 +557,61 @@ def _process_gpu(
             green = (lum_weight * gray + gm * g_src + threshold_offset).clamp_(0.0, 255.0)
             red   = (lum_weight * gray + rm * r_src + threshold_offset).clamp_(0.0, 255.0)
 
-            # Stack → (H, W, 3) BGR, download to CPU as uint8
+            _t1 = time.perf_counter()
+
+            # Download to CPU as uint8
             bgr_out = torch.stack([blue, green, red], dim=-1).byte().cpu().numpy()
-            writer.write(bgr_out)
+
+            _t2 = time.perf_counter()
+
+            try:
+                write_q.put(bgr_out, timeout=60)
+            except queue.Full:
+                if write_exc[0] is not None:
+                    raise write_exc[0]
+                raise RuntimeError("Writer queue full after 60s — writer thread may have stalled")
+
             written += 1
+            _t3 = time.perf_counter()
+
+            _t_compute  += _t1 - _t0
+            _t_transfer += _t2 - _t1
+            _t_queue    += _t3 - _t2
 
             if written % 300 == 0:
                 _progress(frame_idx, total_frames, time.perf_counter() - start_time, written)
+                logger.debug(
+                    "Per-frame avg (last 300): compute={:.1f}ms  transfer={:.1f}ms  queue_put={:.1f}ms",
+                    _t_compute / 300 * 1000, _t_transfer / 300 * 1000, _t_queue / 300 * 1000,
+                )
+                _t_compute = _t_transfer = _t_queue = 0.0
+
     except KeyboardInterrupt:
         interrupted = True
         logger.debug("GPU loop: interrupted after {} frames written", written)
     finally:
-        # Drain the queue so the reader thread can unblock from q.put() and exit
+        # Drain read queue so reader thread can unblock and exit
         while True:
             try:
-                q.get_nowait()
+                read_q.get_nowait()
             except queue.Empty:
                 break
         reader_thread.join(timeout=2)
+
+        # Drain write queue on interrupt so writer thread can reach the sentinel
+        if interrupted:
+            while True:
+                try:
+                    write_q.get_nowait()
+                except queue.Empty:
+                    break
+        try:
+            write_q.put(None, timeout=5)
+        except queue.Full:
+            pass
+        writer_thread.join(timeout=30)
+        if write_exc[0] is not None and not interrupted:
+            raise write_exc[0]
 
     return written, interrupted
 
@@ -501,6 +650,16 @@ def _process_gpu_torchcodec(
     start_time  = time.perf_counter()
     interrupted = False
 
+    # Pre-allocate a single pinned (page-locked) CPU buffer for fast non-blocking
+    # GPU→CPU transfers.  Allocated once, reused every frame — memory is stable.
+    # A standalone numpy copy is made before queuing so the buffer is immediately
+    # free for the next frame's transfer.
+    pinned_buf = torch.empty(h, w, 3, dtype=torch.uint8).pin_memory()
+
+    _t_compute = _t_transfer = _t_queue = 0.0
+
+    write_q, writer_thread, write_exc = _start_writer_thread(writer)
+
     try:
         with ctx:
             decoder = _VideoDecoder(input_path, device=str(torch_device))
@@ -509,6 +668,11 @@ def _process_gpu_torchcodec(
             for frame_idx, frame_batch in enumerate(decoder):
                 if frame_idx % step != 0:
                     continue
+
+                if write_exc[0] is not None:
+                    raise write_exc[0]
+
+                _t0 = time.perf_counter()
 
                 # frame_batch.data: [C, H, W] uint8 RGB on GPU
                 frame = frame_batch.data.float()  # [C, H, W] float32
@@ -549,16 +713,60 @@ def _process_gpu_torchcodec(
                 green = (lum_weight * gray + gm * g_src + threshold_offset).clamp_(0.0, 255.0)
                 red   = (lum_weight * gray + rm * r_src + threshold_offset).clamp_(0.0, 255.0)
 
-                bgr_out = torch.stack([blue, green, red], dim=-1).byte().cpu().numpy()
-                writer.write(bgr_out)
-                written += 1
+                bgr_gpu = torch.stack([blue, green, red], dim=-1).byte()
 
-                if written % 30 == 0:
+                _t1 = time.perf_counter()
+
+                # Non-blocking DMA into pinned buffer, then sync before reading.
+                # Faster than .cpu() into pageable memory; sync is cheap once the
+                # transfer is already in flight.
+                pinned_buf.copy_(bgr_gpu, non_blocking=True)
+                torch.cuda.current_stream(torch_device).synchronize()
+                # Copy pinned view to a standalone array so the buffer is free for
+                # the next frame before the writer thread has consumed this one.
+                bgr_out = pinned_buf.numpy().copy()
+
+                _t2 = time.perf_counter()
+
+                try:
+                    write_q.put(bgr_out, timeout=60)
+                except queue.Full:
+                    if write_exc[0] is not None:
+                        raise write_exc[0]
+                    raise RuntimeError("Writer queue full after 60s — writer thread may have stalled")
+
+                written += 1
+                _t3 = time.perf_counter()
+
+                _t_compute  += _t1 - _t0
+                _t_transfer += _t2 - _t1
+                _t_queue    += _t3 - _t2
+
+                if written % 300 == 0:
                     _progress(frame_idx, total_frames, time.perf_counter() - start_time, written)
+                    logger.debug(
+                        "Per-frame avg (last 300): compute={:.1f}ms  transfer={:.1f}ms  queue_put={:.1f}ms",
+                        _t_compute / 300 * 1000, _t_transfer / 300 * 1000, _t_queue / 300 * 1000,
+                    )
+                    _t_compute = _t_transfer = _t_queue = 0.0
 
     except KeyboardInterrupt:
         interrupted = True
         logger.debug("TorchCodec GPU loop: interrupted after {} frames written", written)
+    finally:
+        if interrupted:
+            while True:
+                try:
+                    write_q.get_nowait()
+                except queue.Empty:
+                    break
+        try:
+            write_q.put(None, timeout=5)
+        except queue.Full:
+            pass
+        writer_thread.join(timeout=30)
+        if write_exc[0] is not None and not interrupted:
+            raise write_exc[0]
 
     return written, interrupted
 
@@ -621,9 +829,18 @@ def process_motion_video(
         h = int(src_h * scale_factor)
 
         os.makedirs(os.path.dirname(os.path.abspath(work_output)), exist_ok=True)
-        codec, writer = _pick_codec(work_output, w, h, fps)
 
         _use_torchcodec = resolved == "cuda" and _TORCHCODEC_AVAILABLE
+        # For GPU paths, pipe frames directly into FFmpeg (NVENC when available).
+        # This avoids the huge intermediate mp4v file and the separate --compress
+        # step — the output is already compressed H.265.
+        _use_pipe = resolved == "cuda" and _ffmpeg_available()
+        if _use_pipe:
+            writer = _FFmpegPipeWriter(work_output, w, h, fps, crf=crf)
+            codec  = "hevc_nvenc (pipe)" if _nvenc_available() else "libx265 (pipe)"
+        else:
+            codec, writer = _pick_codec(work_output, w, h, fps)
+
         logger.info(
             "{}x{}  {} frames  {:.2f} fps  strategy={}  device={}  codec={}",
             src_w, src_h, total_frames, fps, strategy,
@@ -674,8 +891,10 @@ def process_motion_video(
                     written, elapsed, written / elapsed, out_mb)
 
         if compress:
-            if _ffmpeg_available():
-                logger.info("Compressing with FFmpeg H.264 (crf={})...", crf)
+            if _use_pipe:
+                logger.info("--compress skipped: output was already encoded via FFmpeg pipe.")
+            elif _ffmpeg_available():
+                logger.info("Compressing with FFmpeg H.265...")
                 _compress_with_ffmpeg(work_output, crf=crf)
                 compressed_mb = Path(work_output).stat().st_size / 1_048_576 if Path(work_output).exists() else 0
                 logger.info("Compressed: {:.1f} MB ({:.0f}% of original)", compressed_mb, 100 * compressed_mb / out_mb)
