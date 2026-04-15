@@ -188,9 +188,12 @@ class _FFmpegPipeWriter:
             vcodec_args = ["-c:v", "hevc_nvenc", "-preset", "p7", "-cq", str(quality)]
             logger.debug("FFmpegPipeWriter: hevc_nvenc  cq={}", quality)
         else:
-            quality = crf if crf is not None else 26
-            vcodec_args = ["-c:v", "libx265", "-crf", str(quality), "-preset", "medium"]
-            logger.debug("FFmpegPipeWriter: libx265  crf={}", quality)
+            # libx264 ultrafast encodes at 300+ fps at 1440p on a modern CPU,
+            # removing the write bottleneck entirely.  libx265 medium was too
+            # slow (~45fps) and became the pipeline bottleneck.
+            quality = crf if crf is not None else 23
+            vcodec_args = ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", str(quality)]
+            logger.debug("FFmpegPipeWriter: libx264 ultrafast  crf={}", quality)
 
         cmd = [
             "ffmpeg", "-y",
@@ -831,16 +834,15 @@ def process_motion_video(
         os.makedirs(os.path.dirname(os.path.abspath(work_output)), exist_ok=True)
 
         _use_torchcodec = resolved == "cuda" and _TORCHCODEC_AVAILABLE
-        # Only use FFmpeg pipe when NVENC is available: NVENC encodes fast enough
-        # that it doesn't bottleneck the GPU loop.  Without NVENC, libx265 is
-        # CPU-bound and slower than writing mp4v and compressing in a separate pass.
-        _use_pipe = resolved == "cuda" and _nvenc_available()
+        # Use FFmpeg pipe for all GPU paths when FFmpeg is available:
+        #   NVENC present    → hevc_nvenc (GPU encode, best compression)
+        #   NVENC absent     → libx264 ultrafast (fast CPU encode, no bottleneck)
+        # Fall back to cv2.VideoWriter only when FFmpeg is not in PATH.
+        _use_pipe = resolved == "cuda" and _ffmpeg_available()
         if _use_pipe:
             writer = _FFmpegPipeWriter(work_output, w, h, fps, crf=crf)
-            codec  = "hevc_nvenc (pipe)"
+            codec  = "hevc_nvenc (pipe)" if _nvenc_available() else "libx264 ultrafast (pipe)"
         else:
-            if resolved == "cuda" and _ffmpeg_available() and not _nvenc_available():
-                logger.info("NVENC not available — using cv2 writer (use --compress for H.265 afterward)")
             codec, writer = _pick_codec(work_output, w, h, fps)
 
         logger.info(
