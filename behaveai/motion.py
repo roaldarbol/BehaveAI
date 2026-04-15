@@ -831,14 +831,16 @@ def process_motion_video(
         os.makedirs(os.path.dirname(os.path.abspath(work_output)), exist_ok=True)
 
         _use_torchcodec = resolved == "cuda" and _TORCHCODEC_AVAILABLE
-        # For GPU paths, pipe frames directly into FFmpeg (NVENC when available).
-        # This avoids the huge intermediate mp4v file and the separate --compress
-        # step — the output is already compressed H.265.
-        _use_pipe = resolved == "cuda" and _ffmpeg_available()
+        # Only use FFmpeg pipe when NVENC is available: NVENC encodes fast enough
+        # that it doesn't bottleneck the GPU loop.  Without NVENC, libx265 is
+        # CPU-bound and slower than writing mp4v and compressing in a separate pass.
+        _use_pipe = resolved == "cuda" and _nvenc_available()
         if _use_pipe:
             writer = _FFmpegPipeWriter(work_output, w, h, fps, crf=crf)
-            codec  = "hevc_nvenc (pipe)" if _nvenc_available() else "libx265 (pipe)"
+            codec  = "hevc_nvenc (pipe)"
         else:
+            if resolved == "cuda" and _ffmpeg_available() and not _nvenc_available():
+                logger.info("NVENC not available — using cv2 writer (use --compress for H.265 afterward)")
             codec, writer = _pick_codec(work_output, w, h, fps)
 
         logger.info(
