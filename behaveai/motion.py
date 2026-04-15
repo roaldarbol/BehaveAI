@@ -153,15 +153,33 @@ def _done_line() -> None:
 # FFmpeg compression
 # ---------------------------------------------------------------------------
 
+def _ffmpeg_bin() -> str:
+    """Return the ffmpeg executable to use.
+
+    Set the BEHAVEAI_FFMPEG environment variable to override the default
+    ``ffmpeg`` (e.g. to point at an NVENC-capable build from Gyan.dev when
+    the system / conda-forge ffmpeg was compiled without NVENC support).
+
+    Example in pixi.toml::
+
+        [feature.behaveai.activation.env]
+        BEHAVEAI_FFMPEG = "C:/tools/ffmpeg-full/bin/ffmpeg.exe"
+    """
+    return os.environ.get("BEHAVEAI_FFMPEG", "ffmpeg")
+
+
 def _ffmpeg_available() -> bool:
-    return shutil.which("ffmpeg") is not None
+    bin_ = _ffmpeg_bin()
+    if os.sep in bin_ or "/" in bin_:
+        return os.path.isfile(bin_)
+    return shutil.which(bin_) is not None
 
 
 def _nvenc_available() -> bool:
-    """Return True if FFmpeg was built with hevc_nvenc support."""
+    """Return True if the active FFmpeg binary was built with hevc_nvenc support."""
     try:
         result = subprocess.run(
-            ["ffmpeg", "-encoders"],
+            [_ffmpeg_bin(), "-encoders"],
             capture_output=True, check=True,
         )
         return b"hevc_nvenc" in result.stdout
@@ -196,7 +214,7 @@ class _FFmpegPipeWriter:
             logger.debug("FFmpegPipeWriter: libx264 ultrafast  crf={}", quality)
 
         cmd = [
-            "ffmpeg", "-y",
+            _ffmpeg_bin(), "-y",
             "-f", "rawvideo", "-pix_fmt", "bgr24",
             "-s", f"{w}x{h}", "-r", str(fps),
             "-i", "pipe:0",
@@ -286,7 +304,7 @@ def _compress_with_ffmpeg(path: str, crf: int | None = None) -> None:
         logger.info("NVENC not available — using CPU encoding (libx265)")
         codec_args = ["-c:v", "libx265", "-crf", str(crf if crf is not None else 26), "-preset", "medium"]
     cmd = [
-        "ffmpeg", "-y", "-i", path,
+        _ffmpeg_bin(), "-y", "-i", path,
         *codec_args,
         "-c:a", "copy",
         "-movflags", "+faststart",
@@ -659,7 +677,8 @@ def _process_gpu_torchcodec(
     # free for the next frame's transfer.
     pinned_buf = torch.empty(h, w, 3, dtype=torch.uint8).pin_memory()
 
-    _t_compute = _t_transfer = _t_queue = 0.0
+    _t_compute = _t_transfer = _t_queue = _t_decode = 0.0
+    _t_last_frame_end = start_time  # tracks end of previous frame for decode timing
 
     write_q, writer_thread, write_exc = _start_writer_thread(writer)
 
@@ -672,13 +691,18 @@ def _process_gpu_torchcodec(
                 if frame_idx % step != 0:
                     continue
 
+                # Time from end of previous frame's queue_put to now = TorchCodec
+                # iterator overhead + NVDEC decode latency for this frame.
+                _t_iter = time.perf_counter()
+                _t_decode += _t_iter - _t_last_frame_end
+
                 if write_exc[0] is not None:
                     raise write_exc[0]
 
                 _t0 = time.perf_counter()
 
                 # frame_batch.data: [C, H, W] uint8 RGB on GPU
-                frame = frame_batch.data.float()  # [C, H, W] float32
+                frame = frame_batch.data.half()  # [C, H, W] float16 — halves memory bandwidth
 
                 if scale_factor != 1.0:
                     frame = F.interpolate(
@@ -690,6 +714,7 @@ def _process_gpu_torchcodec(
 
                 if prev_frames is None:
                     prev_frames = [gray, gray.clone(), gray.clone()]
+                    _t_last_frame_end = time.perf_counter()
                     continue
 
                 d0 = (prev_frames[0] - gray).abs_()
@@ -740,6 +765,7 @@ def _process_gpu_torchcodec(
 
                 written += 1
                 _t3 = time.perf_counter()
+                _t_last_frame_end = _t3
 
                 _t_compute  += _t1 - _t0
                 _t_transfer += _t2 - _t1
@@ -748,10 +774,11 @@ def _process_gpu_torchcodec(
                 if written % 300 == 0:
                     _progress(frame_idx, total_frames, time.perf_counter() - start_time, written)
                     logger.debug(
-                        "Per-frame avg (last 300): compute={:.1f}ms  transfer={:.1f}ms  queue_put={:.1f}ms",
-                        _t_compute / 300 * 1000, _t_transfer / 300 * 1000, _t_queue / 300 * 1000,
+                        "Per-frame avg (last 300): decode={:.1f}ms  compute={:.1f}ms  transfer={:.1f}ms  queue_put={:.1f}ms",
+                        _t_decode  / 300 * 1000, _t_compute / 300 * 1000,
+                        _t_transfer / 300 * 1000, _t_queue   / 300 * 1000,
                     )
-                    _t_compute = _t_transfer = _t_queue = 0.0
+                    _t_compute = _t_transfer = _t_queue = _t_decode = 0.0
 
     except KeyboardInterrupt:
         interrupted = True
