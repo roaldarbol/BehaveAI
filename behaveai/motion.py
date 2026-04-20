@@ -817,6 +817,7 @@ def process_motion_video(
     scale_factor: float = 1.0,
     frame_skip: int = 0,
     motion_threshold: int = 0,
+    motion_only: bool = False,
     compress: bool = False,
     crf: int | None = None,
     device: str = "auto",
@@ -879,6 +880,9 @@ def process_motion_video(
             codec,
         )
         logger.info("Output: {}", output_path)
+
+        if motion_only:
+            lum_weight = 0.0
 
         start_time = time.perf_counter()
         try:
