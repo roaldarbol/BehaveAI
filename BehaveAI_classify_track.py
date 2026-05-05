@@ -607,8 +607,8 @@ if primary_motion_classes[0] != '0':
 expA2 = 1 - expA
 expB2 = 1 - expB
 
-input_folder = "./input/"
-output_folder = "./output/"
+#input_folder = "./input/"
+#output_folder = "./output/"
 
 progress_update = 10 # print progress every n frames
 
