@@ -8,13 +8,13 @@ import threading
 import configparser
 import sys
 from ultralytics import YOLO
-from scipy.optimize import linear_sum_assignment
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from collections import deque
 import platform
 import subprocess
 import box_geometry as bg
+from kalman_tracker import KalmanTracker
 
 
 
@@ -278,17 +278,20 @@ try:
 	rgb_multipliers = [float(x) for x in config['DEFAULT']['rgb_multipliers'].split(',')]
 	primary_conf_thresh = float(config['DEFAULT'].get('primary_conf_thresh','0.5'))
 	secondary_conf_thresh = float(config['DEFAULT'].get('secondary_conf_thresh','0.5'))
-	match_distance_thresh = float(config['DEFAULT'].get('match_distance_thresh','200'))
-	delete_after_missed = float(config['DEFAULT'].get('delete_after_missed','5'))
-	centroid_merge_thresh = float(config['DEFAULT'].get('centroid_merge_thresh','50'))
+	# tracking thresholds are ratios of each track/detection's own estimated body scale
+	# (box_geometry.detection_scale), not absolute pixels - see kalman_tracker.py
+	match_distance_ratio = float(config['DEFAULT'].get('match_distance_ratio','2.5'))
+	delete_after_missed = float(config['DEFAULT'].get('delete_after_missed','15'))
+	centroid_merge_ratio = float(config['DEFAULT'].get('centroid_merge_ratio','0.7'))
 	iou_thresh = float(config['DEFAULT'].get('iou_thresh','0.95'))
+	merge_aware = config['DEFAULT'].get('merge_aware','true').lower() == 'true'
 	line_thickness = int(config['DEFAULT'].get('line_thickness','1'))
 	font_size = float(config['DEFAULT'].get('font_size','0.5'))
 	frame_skip = int(config['DEFAULT'].get('frame_skip','0'))
 
-	process_noise_pos = float(config['kalman'].get('process_noise_pos','0.01'))
-	process_noise_vel = float(config['kalman'].get('process_noise_vel','0.1'))
-	measurement_noise = float(config['kalman'].get('measurement_noise','0.1'))
+	process_noise_pos_ratio = float(config['kalman'].get('process_noise_pos_ratio','0.05'))
+	process_noise_vel_ratio = float(config['kalman'].get('process_noise_vel_ratio','0.1'))
+	measurement_noise_ratio = float(config['kalman'].get('measurement_noise_ratio','0.1'))
 	motion_threshold = -1 * int(config['DEFAULT'].get('motion_threshold','0'))
 
 	oriented = config['DEFAULT'].get('box_shape', 'boxes').lower() == 'oriented'
@@ -311,95 +314,6 @@ os.makedirs(output_folder, exist_ok=True)
 # Utilities
 # -------------------------
 iou = bg.iou  # shared axis-aligned overlap-proportion helper (box_geometry.py)
-
-# -------------------------
-# Tracker
-# -------------------------
-class KalmanTracker:
-	def __init__(self, dist_thresh, max_missed):
-		self.next_id = 1
-		self.tracks = {}
-		self.prev_positions = {}
-		self.dist_thresh = dist_thresh
-		self.max_missed = max_missed
-
-	def _create_kf(self, initial_pt):
-		kf = cv2.KalmanFilter(4,2)
-		kf.transitionMatrix = np.array([[1,0,1,0],[0,1,0,1],[0,0,1,0],[0,0,0,1]], dtype=np.float32)
-		kf.measurementMatrix = np.array([[1,0,0,0],[0,1,0,0]], dtype=np.float32)
-		kf.processNoiseCov = np.diag([process_noise_pos, process_noise_pos, process_noise_vel, process_noise_vel]).astype(np.float32)
-		kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * measurement_noise
-		kf.statePre  = np.array([[initial_pt[0]],[initial_pt[1]],[0.],[0.]], dtype=np.float32)
-		kf.statePost = kf.statePre.copy()
-		return kf
-
-	def predict_all(self):
-		preds = []
-		for tid, tr in self.tracks.items():
-			pred = tr['kf'].predict()
-			preds.append((tid, (float(pred[0,0]), float(pred[1,0]))))
-		return preds
-
-	def update(self, detections):
-		preds = self.predict_all()
-		track_ids = [t[0] for t in preds]
-		pred_pts   = [t[1] for t in preds]
-
-		if pred_pts and detections:
-			cost = np.zeros((len(pred_pts), len(detections)), dtype=np.float32)
-			for i, p in enumerate(pred_pts):
-				for j, d in enumerate(detections):
-					cost[i,j] = np.hypot(p[0]-d[0], p[1]-d[1])
-			row_idx, col_idx = linear_sum_assignment(cost)
-		else:
-			row_idx = np.array([], dtype=int); col_idx = np.array([], dtype=int)
-			cost = np.array([])
-
-		assigned_detects = {}; matched_tracks = set(); matched_dets = set()
-
-		for r,c in zip(row_idx, col_idx):
-			if cost[r,c] < self.dist_thresh:
-				tid = track_ids[r]
-				matched_tracks.add(tid); matched_dets.add(c); assigned_detects[c] = tid
-				dpt = detections[c]
-				meas = np.array([[np.float32(dpt[0])],[np.float32(dpt[1])]])
-				self.tracks[tid]['kf'].correct(meas)
-				self.tracks[tid]['missed'] = 0
-				self.prev_positions[tid] = (dpt[0], dpt[1])
-
-		for i, dpt in enumerate(detections):
-			if i in matched_dets: continue
-			best_tid, best_dist = None, float('inf')
-			for tid,(px,py) in preds:
-				d = np.hypot(dpt[0]-px, dpt[1]-py)
-				if d < best_dist:
-					best_dist, best_tid = d, tid
-			if best_dist < self.dist_thresh:
-				assigned_detects[i] = best_tid
-				self.tracks[best_tid]['missed'] = 0
-				meas = np.array([[np.float32(dpt[0])],[np.float32(dpt[1])]])
-				self.tracks[best_tid]['kf'].correct(meas)
-				self.prev_positions[best_tid] = (dpt[0], dpt[1])
-				matched_tracks.add(best_tid)
-			else:
-				tid = self.next_id
-				kf = self._create_kf(dpt)
-				self.tracks[tid] = {'kf': kf, 'missed': 0}
-				assigned_detects[i] = tid
-				self.prev_positions[tid] = (dpt[0], dpt[1])
-				matched_tracks.add(tid)
-				self.next_id += 1
-
-		for tid in list(self.tracks.keys()):
-			if tid not in matched_tracks:
-				self.tracks[tid]['missed'] += 1
-				noise_scale = min(2.0, 1.0 + self.tracks[tid]['missed'] * 0.2)
-				kf = self.tracks[tid]['kf']; new_noise = kf.processNoiseCov.copy(); new_noise *= noise_scale; kf.processNoiseCov = new_noise
-				if self.tracks[tid]['missed'] > self.max_missed:
-					del self.tracks[tid]
-					if tid in self.prev_positions: del self.prev_positions[tid]
-
-		return assigned_detects
 
 # -------------------------
 # Camera processing
@@ -429,7 +343,9 @@ class CameraProcessor:
 		self.show_detections_in_recording = True
 
 		# Tracker & models
-		self.tracker = KalmanTracker(match_distance_thresh, delete_after_missed)
+		self.tracker = KalmanTracker(match_distance_ratio, delete_after_missed,
+									  process_noise_pos_ratio, process_noise_vel_ratio, measurement_noise_ratio,
+									  merge_aware=merge_aware, frames_per_step=frame_skip + 1)
 		self.model_static = None
 		self.model_motion = None
 		# secondary models keyed by PRIMARY class name (this matches train-time naming)
@@ -930,7 +846,7 @@ class CameraProcessor:
 			# respecting dominant_source - shared with BehaveAI_classify_track.py and the
 			# annotation tool's auto-annotate so the rule behaves identically everywhere
 			# (box_geometry.py)
-			merged_detections = bg.merge_source_detections(all_detections, centroid_merge_thresh, iou_thresh, dominant_source)
+			merged_detections = bg.merge_source_detections(all_detections, centroid_merge_ratio, iou_thresh, dominant_source)
 
 			# Secondary classification, tracking and drawing
 			processed_detections = []
@@ -1000,9 +916,11 @@ class CameraProcessor:
 
 				processed_detections.append(det)
 
-			# Tracking by centroid
-			cents = [d['centroid'] for d in processed_detections]
-			assignment = self.tracker.update(cents)
+			# Tracking - include each detection's own scale so the tracker can gate/size
+			# noise relative to body size instead of absolute pixels
+			dets_for_tracker = [(d['centroid'][0], d['centroid'][1], bg.detection_scale(d))
+								 for d in processed_detections]
+			assignment = self.tracker.update(dets_for_tracker)
 
 			# Draw and write CSV rows
 			for idx, det in enumerate(processed_detections):

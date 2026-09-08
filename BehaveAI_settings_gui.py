@@ -769,35 +769,39 @@ class SettingsEditorApp(tk.Tk):
 		tab4 = ttk.Frame(notebook)
 		notebook.add(tab4, text='Tracking')
 
-		ttk.Label(tab4, text='Match distance thresh').grid(row=0, column=0, sticky='w', padx=8, pady=(8,0))
-		self.match_distance_var = tk.IntVar(value=200)
-		ttk.Spinbox(tab4, from_=1, to=10000, textvariable=self.match_distance_var, width=8, command=self._set_dirty).grid(row=0, column=1, sticky='w', padx=8)
+		ttk.Label(tab4, text='Match distance ratio (x body length)').grid(row=0, column=0, sticky='w', padx=8, pady=(8,0))
+		self.match_distance_var = tk.DoubleVar(value=2.5)
+		ttk.Spinbox(tab4, from_=0.1, to=10.0, increment=0.1, textvariable=self.match_distance_var, width=8, command=self._set_dirty).grid(row=0, column=1, sticky='w', padx=8)
 
 		ttk.Label(tab4, text='Delete after missed').grid(row=1, column=0, sticky='w', padx=8, pady=(6,0))
-		self.delete_after_var = tk.IntVar(value=10)
+		self.delete_after_var = tk.IntVar(value=15)
 		ttk.Spinbox(tab4, from_=1, to=10000, textvariable=self.delete_after_var, width=8, command=self._set_dirty).grid(row=1, column=1, sticky='w', padx=8)
 
-		ttk.Label(tab4, text='Centroid merge thresh').grid(row=2, column=0, sticky='w', padx=8, pady=(6,0))
-		self.centroid_merge_var = tk.IntVar(value=50)
-		ttk.Spinbox(tab4, from_=1, to=10000, textvariable=self.centroid_merge_var, width=8, command=self._set_dirty).grid(row=2, column=1, sticky='w', padx=8)
+		ttk.Label(tab4, text='Centroid merge ratio (x avg body length)').grid(row=2, column=0, sticky='w', padx=8, pady=(6,0))
+		self.centroid_merge_var = tk.DoubleVar(value=0.7)
+		ttk.Spinbox(tab4, from_=0.1, to=10.0, increment=0.1, textvariable=self.centroid_merge_var, width=8, command=self._set_dirty).grid(row=2, column=1, sticky='w', padx=8)
 
 		ttk.Label(tab4, text='IOU thresh (overlap required to merge)').grid(row=3, column=0, sticky='w', padx=8, pady=(6,0))
 		self.iou_var = tk.DoubleVar(value=0.5)
 		ttk.Spinbox(tab4, from_=0.0, to=1.0, increment=0.01, textvariable=self.iou_var, width=6, command=self._set_dirty).grid(row=3, column=1, sticky='w', padx=8)
 
+		self.merge_aware_var = tk.BooleanVar(value=True)
+		ttk.Checkbutton(tab4, text='Merge-aware occlusion handling (recommended)', variable=self.merge_aware_var,
+						 command=self._set_dirty).grid(row=4, column=0, columnspan=2, sticky='w', padx=8, pady=(6,0))
+
 		# Kalman subsection
-		ttk.Label(tab4, text='Kalman filter').grid(row=4, column=0, sticky='w', padx=8, pady=(12,0))
-		ttk.Label(tab4, text='Process noise position').grid(row=5, column=0, sticky='w', padx=8)
-		self.kalman_pos_var = tk.DoubleVar(value=0.01)
-		ttk.Entry(tab4, textvariable=self.kalman_pos_var).grid(row=5, column=1, sticky='w', padx=8)
+		ttk.Label(tab4, text='Kalman filter (noise as fraction of body length per frame)').grid(row=5, column=0, sticky='w', padx=8, pady=(12,0))
+		ttk.Label(tab4, text='Process noise position ratio').grid(row=6, column=0, sticky='w', padx=8)
+		self.kalman_pos_var = tk.DoubleVar(value=0.05)
+		ttk.Entry(tab4, textvariable=self.kalman_pos_var).grid(row=6, column=1, sticky='w', padx=8)
 
-		ttk.Label(tab4, text='Process noise velocity').grid(row=6, column=0, sticky='w', padx=8)
-		self.kalman_vel_var = tk.DoubleVar(value=0.01)
-		ttk.Entry(tab4, textvariable=self.kalman_vel_var).grid(row=6, column=1, sticky='w', padx=8)
+		ttk.Label(tab4, text='Process noise velocity ratio').grid(row=7, column=0, sticky='w', padx=8)
+		self.kalman_vel_var = tk.DoubleVar(value=0.1)
+		ttk.Entry(tab4, textvariable=self.kalman_vel_var).grid(row=7, column=1, sticky='w', padx=8)
 
-		ttk.Label(tab4, text='Measurement noise').grid(row=7, column=0, sticky='w', padx=8)
-		self.kalman_meas_var = tk.DoubleVar(value=0.2)
-		ttk.Entry(tab4, textvariable=self.kalman_meas_var).grid(row=7, column=1, sticky='w', padx=8)
+		ttk.Label(tab4, text='Measurement noise ratio').grid(row=8, column=0, sticky='w', padx=8)
+		self.kalman_meas_var = tk.DoubleVar(value=0.1)
+		ttk.Entry(tab4, textvariable=self.kalman_meas_var).grid(row=8, column=1, sticky='w', padx=8)
 
 		# TAB 5: Display
 		tab5 = ttk.Frame(notebook)
@@ -929,21 +933,22 @@ class SettingsEditorApp(tk.Tk):
 		self._update_box_shape_dependent_widgets()
 		
 
-		# tracking
-		self.match_distance_var.set(int(d.get('match_distance_thresh', fallback='200')))
-		self.delete_after_var.set(int(d.get('delete_after_missed', fallback='5')))
-		self.centroid_merge_var.set(int(d.get('centroid_merge_thresh', fallback='50')))
+		# tracking - thresholds are ratios of body length, not absolute pixels (kalman_tracker.py)
+		self.match_distance_var.set(float(d.get('match_distance_ratio', fallback='2.5')))
+		self.delete_after_var.set(int(d.get('delete_after_missed', fallback='15')))
+		self.centroid_merge_var.set(float(d.get('centroid_merge_ratio', fallback='0.7')))
 		self.iou_var.set(float(d.get('iou_thresh', fallback='0.4')))
+		self.merge_aware_var.set(self._str_to_bool(d.get('merge_aware', fallback='true')))
 
 		if 'kalman' in self.cfg:
 			ksec = self.cfg['kalman']
-			self.kalman_pos_var.set(float(ksec.get('process_noise_pos', fallback='0.01')))
-			self.kalman_vel_var.set(float(ksec.get('process_noise_vel', fallback='0.01')))
-			self.kalman_meas_var.set(float(ksec.get('measurement_noise', fallback='0.2')))
+			self.kalman_pos_var.set(float(ksec.get('process_noise_pos_ratio', fallback='0.05')))
+			self.kalman_vel_var.set(float(ksec.get('process_noise_vel_ratio', fallback='0.1')))
+			self.kalman_meas_var.set(float(ksec.get('measurement_noise_ratio', fallback='0.1')))
 		else:
-			self.kalman_pos_var.set(0.01)
-			self.kalman_vel_var.set(0.01)
-			self.kalman_meas_var.set(0.2)
+			self.kalman_pos_var.set(0.05)
+			self.kalman_vel_var.set(0.1)
+			self.kalman_meas_var.set(0.1)
 
 		self._set_dirty(False)
 
@@ -1243,19 +1248,20 @@ class SettingsEditorApp(tk.Tk):
 		new_default['primary_conf_thresh'] = str(self.primary_conf_var.get())
 		new_default['secondary_conf_thresh'] = str(self.secondary_conf_var.get())
 	
-		# tracking
-		new_default['match_distance_thresh'] = str(self.match_distance_var.get())
+		# tracking - thresholds are ratios of body length, not absolute pixels (kalman_tracker.py)
+		new_default['match_distance_ratio'] = str(self.match_distance_var.get())
 		new_default['delete_after_missed'] = str(self.delete_after_var.get())
-		new_default['centroid_merge_thresh'] = str(self.centroid_merge_var.get())
+		new_default['centroid_merge_ratio'] = str(self.centroid_merge_var.get())
 		new_default['iou_thresh'] = str(self.iou_var.get())
-	
+		new_default['merge_aware'] = str(self.merge_aware_var.get()).lower()
+
 		# ---- write kalman section (unchanged logic) ----
 		if 'kalman' not in self.cfg:
 			self.cfg['kalman'] = {}
 		k = self.cfg['kalman']
-		k['process_noise_pos'] = str(self.kalman_pos_var.get())
-		k['process_noise_vel'] = str(self.kalman_vel_var.get())
-		k['measurement_noise'] = str(self.kalman_meas_var.get())
+		k['process_noise_pos_ratio'] = str(self.kalman_pos_var.get())
+		k['process_noise_vel_ratio'] = str(self.kalman_vel_var.get())
+		k['measurement_noise_ratio'] = str(self.kalman_meas_var.get())
 		
 		
 		

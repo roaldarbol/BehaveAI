@@ -222,7 +222,21 @@ def iou(box1, box2):
 	return max(prop1, prop2)
 
 
-def merge_source_detections(all_detections, centroid_merge_thresh, iou_thresh, dominant_source):
+def detection_scale(det):
+	"""Estimate a detection's own body scale (used to make tracking/merge thresholds relative
+	to object size instead of absolute pixels). Oriented detections use their true head-tail
+	length/width (avoids the axis-aligned bbox's rotation-dependent size jitter); otherwise
+	falls back to the average width/height of the axis-aligned box."""
+	head, tail = det.get('head'), det.get('tail')
+	if head is not None and tail is not None:
+		length = _dist(head, tail)
+		width = det.get('width') or 0.0
+		return 0.5 * (length + width) if width else length
+	x1, y1, x2, y2 = det['coords']
+	return 0.5 * (abs(x2 - x1) + abs(y2 - y1))
+
+
+def merge_source_detections(all_detections, centroid_merge_ratio, iou_thresh, dominant_source):
 	"""Merge per-frame detections collected from the static and motion streams into one
 	detection per physical object, resolving which stream's classification wins per the
 	project's `dominant_source` setting. This is the single canonical implementation of that
@@ -240,7 +254,8 @@ def merge_source_detections(all_detections, centroid_merge_thresh, iou_thresh, d
 	  'head', 'tail', 'width': optional, oriented-mode geometry
 
 	Two detections are matched to the same physical object when their centroids are within
-	`centroid_merge_thresh` OR their boxes overlap more than `iou_thresh`. For a matched pair:
+	`centroid_merge_ratio` times their average detection_scale() OR their boxes overlap more
+	than `iou_thresh`. For a matched pair:
 	  - same source, or dominant_source=='confidence': keep whichever has higher primary_conf
 	  - dominant_source=='static'/'motion': the matching-source detection always wins, regardless
 	    of confidence
@@ -252,11 +267,11 @@ def merge_source_detections(all_detections, centroid_merge_thresh, iou_thresh, d
 	Returns merged_detections: one dict per physical object, each with 'coords', 'centroid',
 	'source', 'primary_class', 'primary_conf', 'primary_class_combined', 'primary_conf_combined',
 	and 'head'/'tail'/'width' (None when not oriented)."""
-	centroid_merge_thresh2 = centroid_merge_thresh * centroid_merge_thresh
 	merged_detections = []
 	for det in all_detections:
 		x1, y1, x2, y2 = det['coords']
 		cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+		det_scale = detection_scale(det)
 
 		matched = False
 		for md in merged_detections:
@@ -265,7 +280,8 @@ def merge_source_detections(all_detections, centroid_merge_thresh, iou_thresh, d
 			# avoids both the sqrt and numpy's per-call overhead on a two-number distance
 			dx, dy = cx - md_cx, cy - md_cy
 			dist2 = dx * dx + dy * dy
-			within_centroid = dist2 < centroid_merge_thresh2
+			merge_thresh = centroid_merge_ratio * 0.5 * (det_scale + detection_scale(md))
+			within_centroid = dist2 < merge_thresh * merge_thresh
 
 			# IoU is only needed when the (cheap) centroid check doesn't already resolve the
 			# match, since the two are combined with `or` below - skip it otherwise. This is a

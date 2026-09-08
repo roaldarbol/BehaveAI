@@ -190,7 +190,7 @@ try:
 	font_size = float(config['DEFAULT'].get('font_size', '0.5'))
 	# ~ cross_blocking = config['DEFAULT']['cross_blocking'].lower()
 	iou_thresh = float(config['DEFAULT'].get('iou_thresh', '0.95'))
-	centroid_merge_thresh = float(config['DEFAULT'].get('centroid_merge_thresh', '50'))
+	centroid_merge_ratio = float(config['DEFAULT'].get('centroid_merge_ratio', '0.7'))
 	motion_blocks_static = config['DEFAULT']['motion_blocks_static'].lower()
 	static_blocks_motion = config['DEFAULT']['static_blocks_motion'].lower()
 	save_empty_frames = config['DEFAULT']['save_empty_frames'].lower()
@@ -556,7 +556,7 @@ def _auto_annotate_local_oriented():
 	# Merge static/motion detections of the same physical object, respecting dominant_source -
 	# shared with BehaveAI_classify_track.py/BehaveAI_live.py (box_geometry.py), matching by the
 	# OBB's axis-aligned envelope while carrying the true rotated geometry through unchanged
-	merged = bg.merge_source_detections(all_detections, centroid_merge_thresh, iou_thresh, dominant_source)
+	merged = bg.merge_source_detections(all_detections, centroid_merge_ratio, iou_thresh, dominant_source)
 
 	new_boxes = []
 	for det in merged:
@@ -608,7 +608,7 @@ def auto_annotate_local():
 	# Merge static/motion detections of the same physical object, respecting dominant_source -
 	# shared with BehaveAI_classify_track.py/BehaveAI_live.py (box_geometry.py) so auto-annotate
 	# resolves conflicting static/motion detections the same way batch processing does
-	merged = bg.merge_source_detections(all_detections, centroid_merge_thresh, iou_thresh, dominant_source)
+	merged = bg.merge_source_detections(all_detections, centroid_merge_ratio, iou_thresh, dominant_source)
 
 	new_boxes = []
 	for det in merged:

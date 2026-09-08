@@ -96,6 +96,12 @@ fi
 # shellcheck disable=SC1090
 source "${VENV_DIR}/bin/activate"
 
+# OpenCV's Qt5 highgui backend can fail to show the Live preview window (no error, camera
+# just never appears) under a native Wayland session (e.g. GNOME on Wayland) - forcing the
+# X11/XWayland Qt platform plugin fixes it. This is already the default on X11 systems, so
+# it's a no-op there.
+export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-xcb}"
+
 # Now run the requested python script.
 if [ "$#" -ge 1 ]; then
   # Run args as python command

@@ -4,7 +4,6 @@ import csv
 import os
 import glob
 from ultralytics import YOLO
-from scipy.optimize import linear_sum_assignment
 import configparser
 import time
 import shutil
@@ -14,6 +13,7 @@ import subprocess
 # ~ import config_watcher
 import sys
 import box_geometry as bg
+from kalman_tracker import KalmanTracker
 
 
 # --- NCNN helper utilities -----------------------
@@ -312,17 +312,20 @@ try:
 	use_ncnn = config['DEFAULT']['use_ncnn'].lower()
 	primary_conf_thresh = float(config['DEFAULT'].get('primary_conf_thresh', '0.5'))
 	secondary_conf_thresh = float(config['DEFAULT'].get('secondary_conf_thresh', '0.5'))
-	match_distance_thresh = float(config['DEFAULT'].get('match_distance_thresh', '200'))
-	delete_after_missed = float(config['DEFAULT'].get('delete_after_missed', '5'))
-	centroid_merge_thresh = float(config['DEFAULT'].get('centroid_merge_thresh', '50'))
+	# tracking thresholds are ratios of each track/detection's own estimated body scale
+	# (box_geometry.detection_scale), not absolute pixels - see kalman_tracker.py
+	match_distance_ratio = float(config['DEFAULT'].get('match_distance_ratio', '2.5'))
+	delete_after_missed = float(config['DEFAULT'].get('delete_after_missed', '15'))
+	centroid_merge_ratio = float(config['DEFAULT'].get('centroid_merge_ratio', '0.7'))
 	iou_thresh = float(config['DEFAULT'].get('iou_thresh', '0.95'))
+	merge_aware = config['DEFAULT'].get('merge_aware', 'true').lower() == 'true'
 	line_thickness = int(config['DEFAULT'].get('line_thickness', '1'))
 	font_size = float(config['DEFAULT'].get('font_size', '0.5'))
 	frame_skip = int(config['DEFAULT'].get('frame_skip', '0'))
 
-	process_noise_pos = float(config['kalman'].get('process_noise_pos', '0.01'))
-	process_noise_vel = float(config['kalman'].get('process_noise_vel', '0.1'))
-	measurement_noise = float(config['kalman'].get('measurement_noise', '0.1'))
+	process_noise_pos_ratio = float(config['kalman'].get('process_noise_pos_ratio', '0.05'))
+	process_noise_vel_ratio = float(config['kalman'].get('process_noise_vel_ratio', '0.1'))
+	measurement_noise_ratio = float(config['kalman'].get('measurement_noise_ratio', '0.1'))
 	motion_threshold = -1 * int(config['DEFAULT'].get('motion_threshold', '0'))
 
 	oriented = config['DEFAULT'].get('box_shape', 'boxes').lower() == 'oriented'
@@ -705,173 +708,6 @@ progress_update = 10 # print progress every n frames
 iou = bg.iou  # shared axis-aligned overlap-proportion helper (box_geometry.py)
 	
 
-# --- TRACKER CLASS -------------------------------------------------------
-class KalmanTracker:
-	def __init__(self, dist_thresh, max_missed):
-		self.next_id = 1
-		self.tracks = {}  # tid -> {'kf': KalmanFilter, 'missed': int}
-		self.prev_positions = {}  # Track previous positions
-		self.dist_thresh = dist_thresh
-		self.max_missed = max_missed
-
-	def _create_kf(self, initial_pt):
-
-		#Create a 4D state (x, y, vx, vy) Kalman Filter measuring (x, y).
-		kf = cv2.KalmanFilter(4, 2)
-		# State transition: x' = x + vx, y' = y + vy
-		kf.transitionMatrix = np.array([[1, 0, 1, 0],
-										[0, 1, 0, 1],
-										[0, 0, 1, 0],
-										[0, 0, 0, 1]], dtype=np.float32)
-		# Measurement: we only observe x, y
-		kf.measurementMatrix = np.array([[1, 0, 0, 0],
-										 [0, 1, 0, 0]], dtype=np.float32)
-		# Tune these covariances to your scene
-
-		kf.processNoiseCov = np.diag([process_noise_pos, process_noise_pos, process_noise_vel, process_noise_vel]).astype(np.float32)	
-		kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * measurement_noise
-		# Initialize state
-		kf.statePre  = np.array([[initial_pt[0]],
-								 [initial_pt[1]],
-								 [0.],
-								 [0.]], dtype=np.float32)
-		kf.statePost = kf.statePre.copy()
-		return kf
-		
-		self._prune_duplicate_tracks()
-
-	def predict_all(self):
-		"""
-		Predict the next position for every track.
-		Returns list of (tid, predicted_pt).
-		"""
-		preds = []
-		for tid, tr in self.tracks.items():
-			pred = tr['kf'].predict()
-			preds.append((tid, (float(pred[0, 0]), float(pred[1, 0]))))
-		return preds
-
-		
-		
-	def _prune_duplicate_tracks(self):
-		"""
-		Merge any two tracks whose current posteriors are very close.
-		Call this at the end of update().
-		"""
-		tids = list(self.tracks.keys())
-		posts = {}
-		for tid in tids:
-			sp = self.tracks[tid]['kf'].statePost
-			posts[tid] = (float(sp[0,0]), float(sp[1,0]))
-		to_drop = set()
-		for i, t1 in enumerate(tids):
-			x1, y1 = posts[t1]
-			for t2 in tids[i+1:]:
-				x2, y2 = posts[t2]
-				if np.hypot(x1-x2, y1-y2) < self.dist_thresh * 0.5:
-					# mark the higher ID for deletion
-					to_drop.add(max(t1, t2))
-		for tid in to_drop:
-			del self.tracks[tid]
-
-	def update(self, detections):
-
-		#detections: list of (x, y) centroids
-		#Returns a dict: detection_index -> track_id
-
-		# 1) Predict all tracks forward one step
-		preds = self.predict_all()  # list of (tid, (px, py))
-		track_ids = [t[0] for t in preds]
-		pred_pts   = [t[1] for t in preds]
-
-		# 2) Build cost matrix = Euclidean distance
-		if pred_pts and detections:
-			cost = np.zeros((len(pred_pts), len(detections)), dtype=np.float32)
-			for i, p in enumerate(pred_pts):
-				for j, d in enumerate(detections):
-					cost[i, j] = np.hypot(p[0] - d[0], p[1] - d[1])
-			row_idx, col_idx = linear_sum_assignment(cost)
-		else:
-			row_idx = np.array([], dtype=int)
-			col_idx = np.array([], dtype=int)
-
-		assigned_detects = {}
-		matched_tracks = set()
-		matched_dets   = set()
-
-		# 3) Associate tracks ↔ detections
-		for r, c in zip(row_idx, col_idx):
-			if cost[r, c] < self.dist_thresh:
-				tid = track_ids[r]
-				matched_tracks.add(tid)
-				matched_dets.add(c)
-				assigned_detects[c] = tid
-
-				# Get the measurement point
-				dpt = detections[c]
-				meas = np.array([[np.float32(dpt[0])], [np.float32(dpt[1])]])
-				
-				# Correct KF with the detection measurement
-				self.tracks[tid]['kf'].correct(meas)
-				self.tracks[tid]['missed'] = 0
-				
-				# Update previous position
-				self.prev_positions[tid] = (dpt[0], dpt[1])
-
-		# 4) Process unassigned detections
-		for i, dpt in enumerate(detections):
-			if i in matched_dets:
-				continue
-				
-			# try to find an existing track under the threshold
-			best_tid, best_dist = None, float('inf')
-			for tid, (px, py) in preds:
-				d = np.hypot(dpt[0]-px, dpt[1]-py)
-				if d < best_dist:
-					best_dist, best_tid = d, tid
-
-			if best_dist < self.dist_thresh:
-				assigned_detects[i] = best_tid
-				self.tracks[best_tid]['missed'] = 0
-				meas = np.array([[np.float32(dpt[0])], [np.float32(dpt[1])]])
-				self.tracks[best_tid]['kf'].correct(meas)
-				
-				# Update previous position
-				self.prev_positions[best_tid] = (dpt[0], dpt[1])
-				matched_tracks.add(best_tid)  # Add to matched tracks
-
-			else:
-				# New track
-				tid = self.next_id
-				kf = self._create_kf(dpt)
-				self.tracks[tid] = {'kf': kf, 'missed': 0}
-				assigned_detects[i] = tid
-				self.prev_positions[tid] = (dpt[0], dpt[1])  # Initialize position
-				matched_tracks.add(tid)  # Add to matched tracks
-				self.next_id += 1
-
-		# 5) Handle unmatched tracks
-		for tid in list(self.tracks.keys()):
-			if tid not in matched_tracks:
-				self.tracks[tid]['missed'] += 1
-				# Increase uncertainty when missing detections
-				noise_scale = min(2.0, 1.0 + self.tracks[tid]['missed'] * 0.2)
-				
-				# FIXED: Preserve matrix type and structure
-				kf = self.tracks[tid]['kf']
-				new_noise = kf.processNoiseCov.copy()
-				new_noise *= noise_scale
-				kf.processNoiseCov = new_noise
-					
-				# Remove track if missed too many times
-				if self.tracks[tid]['missed'] > self.max_missed:
-					del self.tracks[tid]
-					if tid in self.prev_positions:
-						del self.prev_positions[tid]
-
-		return assigned_detects
-
-
 # --- MAIN PROCESSING -----------------------------------------------------
 def process_video(file):
 	os.makedirs(output_folder, exist_ok=True)
@@ -902,7 +738,9 @@ def process_video(file):
 			model_motion = YOLO(primary_motion_model_path)
 		
 		
-	tracker = KalmanTracker(match_distance_thresh, delete_after_missed)
+	tracker = KalmanTracker(match_distance_ratio, delete_after_missed,
+							 process_noise_pos_ratio, process_noise_vel_ratio, measurement_noise_ratio,
+							 merge_aware=merge_aware, frames_per_step=frame_skip + 1)
 
 	prev_frames, frame_idx = None, 0
 	csv_file = open(os.path.join(output_folder, base + "_tracking.csv"), 'w', newline='')
@@ -1053,7 +891,7 @@ def process_video(file):
 			# Merge detections from the static/motion streams into one per physical object,
 			# respecting dominant_source - shared with BehaveAI_live.py and the annotation
 			# tool's auto-annotate so the rule behaves identically everywhere (box_geometry.py)
-			merged_detections = bg.merge_source_detections(all_detections, centroid_merge_thresh, iou_thresh, dominant_source)
+			merged_detections = bg.merge_source_detections(all_detections, centroid_merge_ratio, iou_thresh, dominant_source)
 	
 	
 	
@@ -1141,9 +979,11 @@ def process_video(file):
 				processed_detections.append(det)
 	
 	
-			# Prepare for tracking
-			cents = [d['centroid'] for d in processed_detections]
-			assignment = tracker.update(cents)
+			# Prepare for tracking - include each detection's own scale so the tracker can
+			# gate/size noise relative to body size instead of absolute pixels
+			dets_for_tracker = [(d['centroid'][0], d['centroid'][1], bg.detection_scale(d))
+								 for d in processed_detections]
+			assignment = tracker.update(dets_for_tracker)
 	
 			# ~ frame = motion_image ## enable this line ot save the motion video instead of static 
 	
