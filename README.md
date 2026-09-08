@@ -23,6 +23,7 @@ The framework also supports hierarchical models (e.g. detect something from it's
 - Computationally efficient - runs fine on low-end devices without GPUs
 - Intuitive user interface with installers for Windows and Linux (including Raspberry Pi) and full user-interface. Also works on MacOS but currently no installer.
 - Free & open source ([GNU Afferro General Public License](https://github.com/troscianko/BehaveAI/blob/main/LICENSE))
+- NEW (September 2026) supports oriented bounding boxes and can track the orientation of objects/animals.
 
 ## User guide & installation instructions
 
