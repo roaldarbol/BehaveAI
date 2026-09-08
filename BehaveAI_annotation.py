@@ -4,6 +4,7 @@
 import os
 import sys
 import time
+import traceback
 import cv2
 import numpy as np
 import configparser
@@ -14,6 +15,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
 from index_annotations import AnnotationIndex
+import box_geometry as bg
 
 
 # Try to import YOLO
@@ -111,7 +113,12 @@ try:
 
 	motion_cropped_base_dir = 'annot_motion_crop'
 	static_cropped_base_dir = 'annot_static_crop'
-	
+	motion_ornt_base_dir = 'annot_motion_ornt'
+	static_ornt_base_dir = 'annot_static_ornt'
+
+	oriented = config['DEFAULT'].get('box_shape', 'boxes').lower() == 'oriented'
+	disambiguate_head_tail = oriented and config['DEFAULT'].get('disambiguate_head_tail', 'false').lower() == 'true'
+
 	if len(secondary_motion_classes) >= 2 or len(secondary_static_classes) >= 2:
 		hierarchical_mode = True
 		
@@ -183,6 +190,7 @@ try:
 	font_size = float(config['DEFAULT'].get('font_size', '0.5'))
 	# ~ cross_blocking = config['DEFAULT']['cross_blocking'].lower()
 	iou_thresh = float(config['DEFAULT'].get('iou_thresh', '0.95'))
+	centroid_merge_thresh = float(config['DEFAULT'].get('centroid_merge_thresh', '50'))
 	motion_blocks_static = config['DEFAULT']['motion_blocks_static'].lower()
 	static_blocks_motion = config['DEFAULT']['static_blocks_motion'].lower()
 	save_empty_frames = config['DEFAULT']['save_empty_frames'].lower()
@@ -206,10 +214,10 @@ secondary_classes_info = list(zip(secondary_hotkeys, secondary_classes))
 primary_class_dict = {ord(key): idx for idx, (key, _) in enumerate(primary_classes_info)}
 secondary_class_dict = {ord(key): idx for idx, (key, _) in enumerate(secondary_classes_info)}
 
-# initial selections
-active_primary = 0
-if len(primary_static_classes) <= 1:
-	active_primary = 1
+# initial selections - default to the first enabled ('0' = disabled placeholder) primary class,
+# not just "index 1 whenever static has <=1 entries" (that conflated "static disabled" with
+# "static has exactly one real class", leaving active_primary pointing at a disabled placeholder).
+active_primary = next((i for i, name in enumerate(primary_classes) if name != '0'), 0)
 active_secondary = 0
 
 
@@ -229,7 +237,8 @@ annotation_index = AnnotationIndex(
 	primary_classes,
 	secondary_classes,
 	hierarchical_mode,
-	ignore_secondary=ignore_secondary
+	ignore_secondary=ignore_secondary,
+	oriented=oriented
 )
 
 items = annotation_index.list_images_labels_and_masks()
@@ -351,7 +360,7 @@ if hierarchical_mode:
 				continue
 			
 			# Create model directory for this static class
-			model_dir = f"model_static_static_{primary_class}"
+			model_dir = f"model_secondary_static_{primary_class}"
 			weights_path = os.path.join(model_dir, "train", "weights", "best.pt")
 			
 			# Check if model exists
@@ -400,6 +409,29 @@ if hierarchical_mode:
 				
 		# ~ print(f"secondary_motion_models {secondary_motion_models}")
 
+ornt_static_models = {}
+ornt_motion_models = {}
+
+if disambiguate_head_tail:
+	for primary_class in primary_classes:
+		data_dir = os.path.join(static_ornt_base_dir, primary_class)
+		if os.path.isdir(data_dir):
+			weights_path = os.path.join(f"model_ornt_static_{primary_class}", "train", "weights", "best.pt")
+			if os.path.exists(weights_path):
+				try:
+					ornt_static_models[primary_class] = YOLO(weights_path)
+				except Exception as e:
+					print(f"Failed to load head/tail static model for '{primary_class}':", e)
+
+		data_dir = os.path.join(motion_ornt_base_dir, primary_class)
+		if os.path.isdir(data_dir):
+			weights_path = os.path.join(f"model_ornt_motion_{primary_class}", "train", "weights", "best.pt")
+			if os.path.exists(weights_path):
+				try:
+					ornt_motion_models[primary_class] = YOLO(weights_path)
+				except Exception as e:
+					print(f"Failed to load head/tail motion model for '{primary_class}':", e)
+
 
 # Helper: convert BGR -> PhotoImage
 
@@ -407,65 +439,6 @@ def cv2_to_photoimage(bgr_img):
 	rgb = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
 	pil = Image.fromarray(rgb)
 	return ImageTk.PhotoImage(pil)
-
-## remove overlapping detections	
-def non_max_suppression(box_list):
-	"""Remove overlapping detections keeping highest confidence box."""
-	if len(box_list) == 0:
-		return []
-	
-	# Calculate overall confidence for each box
-	confidences = []
-	for box in box_list:
-		if hierarchical_mode:
-			conf = box[6]
-		else:
-			conf = box[5]
-
-		confidences.append(conf)
-	
-	# Sort by confidence (descending)
-	sorted_indices = sorted(range(len(box_list)), key=lambda i: confidences[i], reverse=True)
-	suppressed = [False] * len(box_list)
-	keep = []
-	
-	for i in range(len(sorted_indices)):
-		idx_i = sorted_indices[i]
-		if suppressed[idx_i]:
-			continue
-			
-		keep.append(box_list[idx_i])
-		box_i = box_list[idx_i]
-		coords_i = (box_i[0], box_i[1], box_i[2], box_i[3])
-		
-		for j in range(i + 1, len(sorted_indices)):
-			idx_j = sorted_indices[j]
-			if suppressed[idx_j]:
-				continue
-				
-			box_j = box_list[idx_j]
-			coords_j = (box_j[0], box_j[1], box_j[2], box_j[3])
-			
-			if iou(coords_i, coords_j) > iou_thresh:
-				suppressed[idx_j] = True
-				
-	return keep
-
-
-
-def iou(box1, box2):
-	xa = max(box1[0], box2[0]); ya = max(box1[1], box2[1])
-	xb = min(box1[2], box2[2]); yb = min(box1[3], box2[3])
-	inter = max(0, xb-xa) * max(0, yb-ya)
-	area1 = (box1[2]-box1[0])*(box1[3]-box1[1])
-	area2 = (box2[2]-box2[0])*(box2[3]-box2[1])
-	prop1 = inter/area1
-	prop2 = inter/area2
-	if prop1 > prop2:
-		return prop1 if prop1 > 0 else 0
-	else:
-		return prop2 if prop2 > 0 else 0
-
 
 
 # ------------------------------
@@ -482,108 +455,287 @@ def norm_to_pixels(xc, yc, bw, bh, w, h):
 	return x1, y1, x2, y2
 
 
+def _orient_conf(model, img):
+	"""Probability the given whole crop is in the 'correct' (head-left, tail-right) orientation,
+	per the per-primary-class orientation classifier."""
+	if img is None or img.size == 0:
+		return 0.0
+	res = model.predict(img, verbose=False)
+	probs = res[0].probs
+	if probs is None:
+		return 0.0
+	correct_idx = None
+	for idx, name in model.names.items():
+		if name == 'correct':
+			correct_idx = idx
+			break
+	if correct_idx is None:
+		return 0.0
+	return float(probs.data[correct_idx])
+
+
+def _disambiguate_head_tail(crop_img, head, tail, width, primary_class, is_motion):
+	"""Resolve both the mod-180 direction ambiguity AND which axis is actually the head-tail
+	axis of a raw OBB detection (its longer dimension isn't necessarily the true head-tail axis -
+	e.g. a wide-bodied animal can be wider than it is long) using the trained per-primary-class
+	whole-crop orientation classifier. Falls back to the (arbitrary) input head/tail/width when
+	disambiguation is off/unavailable. Returns (head, tail, width)."""
+	if not disambiguate_head_tail:
+		return head, tail, width
+	model = (ornt_motion_models if is_motion else ornt_static_models).get(primary_class)
+	if model is None:
+		return head, tail, width
+	return bg.best_head_tail_orientation(crop_img, head, tail, width, lambda img: _orient_conf(model, img))
+
+
+def _attach_secondary_for_auto_annotate(box, primary_class, is_motion):
+	sec_model = None
+	crop_img = None
+	if is_motion:
+		if len(secondary_motion_classes) >= 2:
+			sec_model = secondary_motion_models.get(primary_class)
+			crop_img = motion_image
+		elif len(secondary_static_classes) >= 2:
+			sec_model = secondary_static_models.get(primary_class)
+			crop_img = fr
+	else:
+		if len(secondary_static_classes) >= 2:
+			sec_model = secondary_static_models.get(primary_class)
+			crop_img = fr
+		elif len(secondary_motion_classes) >= 2:
+			sec_model = secondary_motion_models.get(primary_class)
+			crop_img = motion_image if primary_motion_classes[0] != '0' else fr
+
+	secondary_class_idx = -1
+	secondary_conf = -1.0
+	if sec_model is not None and crop_img is not None:
+		corners = bg.corners_from_head_tail_width(box['head'], box['tail'], box['width'])
+		crop = bg.crop_black_masked(crop_img, corners)
+		if crop is not None and crop.size > 0:
+			sec_results = sec_model.predict(crop, verbose=False)
+			if sec_results[0].probs is not None:
+				secondary_class_idx = sec_results[0].probs.top1
+				secondary_conf = sec_results[0].probs.top1conf.item()
+	box['sec_cls'] = secondary_class_idx
+	box['sec_conf'] = secondary_conf
+	return box
+
+
+def _auto_annotate_local_oriented():
+	global boxes
+	all_detections = []
+
+	if primary_static_classes[0] != '0' and model_static is not None:
+		results_static = model_static.predict(fr, conf=primary_conf_thresh, verbose=False)
+		if results_static[0].obb is not None:
+			for obb_box in results_static[0].obb:
+				class_idx = int(obb_box.cls[0])
+				primary_class = primary_static_classes[class_idx]
+				conf = float(obb_box.conf[0])
+				coords = tuple(map(int, obb_box.xyxy[0].tolist()))
+				cx, cy, bw, bh, angle = [float(v) for v in obb_box.xywhr[0]]
+				head, tail, width = bg.head_tail_width_from_xywhr_rad(cx, cy, bw, bh, angle)
+				head, tail, width = _disambiguate_head_tail(fr, head, tail, width, primary_class, is_motion=False)
+				all_detections.append({'coords': coords, 'primary_class': primary_class, 'primary_conf': conf,
+										'source': 'static', 'head': head, 'tail': tail, 'width': width})
+
+	if primary_motion_classes[0] != '0' and model_motion is not None:
+		results_motion = model_motion.predict(motion_image, conf=primary_conf_thresh, verbose=False)
+		if results_motion[0].obb is not None:
+			for obb_box in results_motion[0].obb:
+				class_idx = int(obb_box.cls[0])
+				primary_class = primary_motion_classes[class_idx]
+				conf = float(obb_box.conf[0])
+				coords = tuple(map(int, obb_box.xyxy[0].tolist()))
+				cx, cy, bw, bh, angle = [float(v) for v in obb_box.xywhr[0]]
+				head, tail, width = bg.head_tail_width_from_xywhr_rad(cx, cy, bw, bh, angle)
+				head, tail, width = _disambiguate_head_tail(motion_image, head, tail, width, primary_class, is_motion=True)
+				all_detections.append({'coords': coords, 'primary_class': primary_class, 'primary_conf': conf,
+										'source': 'motion', 'head': head, 'tail': tail, 'width': width})
+
+	# Merge static/motion detections of the same physical object, respecting dominant_source -
+	# shared with BehaveAI_classify_track.py/BehaveAI_live.py (box_geometry.py), matching by the
+	# OBB's axis-aligned envelope while carrying the true rotated geometry through unchanged
+	merged = bg.merge_source_detections(all_detections, centroid_merge_thresh, iou_thresh, dominant_source)
+
+	new_boxes = []
+	for det in merged:
+		primary_class = det['primary_class']
+		source = det['source']
+		if source == 'static':
+			cls = primary_static_classes.index(primary_class)
+		else:
+			cls = len(primary_static_classes) + primary_motion_classes.index(primary_class)
+		box = {'head': det['head'], 'tail': det['tail'], 'width': det['width'], 'cls': cls, 'conf': det['primary_conf']}
+		if hierarchical_mode:
+			box = _attach_secondary_for_auto_annotate(box, primary_class, is_motion=(source == 'motion'))
+		new_boxes.append(box)
+
+	boxes = new_boxes
+
+
 # Auto-annotate: uses model_static / model_motion and per-primary secondary models
 def auto_annotate_local():
-	# Collect all primary detections
-	# ~ all_detections = []
 	global boxes
-	
+	if oriented:
+		_auto_annotate_local_oriented()
+		return
+
+	all_detections = []
+
 	# Primary static detection
-	if primary_static_classes[0] != '0' and model_static != None:
+	if primary_static_classes[0] != '0' and model_static is not None:
 		results_static = model_static.predict(fr, conf=primary_conf_thresh, verbose=False)
 		for box in results_static[0].boxes:
-			# ~ coords = tuple(map(int, box.xyxy[0].tolist()))
 			class_idx = int(box.cls[0])
 			primary_class = primary_static_classes[class_idx]
 			conf = float(box.conf[0])
 			x1, y1, x2, y2 = map(int, box.xyxy[0])
-
-			if hierarchical_mode:
-				# crop and run secondary classifier on static image
-				if len(secondary_static_classes) >= 2:
-					sec_model = secondary_static_models.get(primary_class, None)
-					sec_classes = secondary_static_classes
-					crop_img = fr
-				# Fallback to motion secondary model if static not available
-				elif len(secondary_motion_classes) >= 2:
-					sec_model = secondary_motion_models.get(primary_class, None)
-					sec_classes = secondary_motion_classes
-					crop_img = motion_image if primary_motion_classes[0] != '0' else fr
-
-				# Get the cropped region
-				crop = None
-				if crop_img is not None:
-					crop = crop_img[y1:y2, x1:x2]
-				
-				secondary_class = primary_class
-				secondary_conf = 1.0
-				secondary_class_idx = -1
-
-				# Run secondary classification if we have a model and valid crop
-				if sec_model and crop is not None and crop.size > 0:
-					sec_results = sec_model.predict(crop, verbose=False)
-					if sec_results[0].probs is not None:
-						secondary_class_idx = sec_results[0].probs.top1
-						secondary_conf = sec_results[0].probs.top1conf.item()
-						secondary_class = sec_model.names[secondary_class_idx]
-
-				boxes.append((x1, y1, x2, y2, class_idx, secondary_class_idx, conf, secondary_conf))#conf 1 & 2 need separating
-				
-
-			else:
-				boxes.append((x1, y1, x2, y2, class_idx, conf))
-
+			all_detections.append({'coords': (x1, y1, x2, y2), 'primary_class': primary_class,
+									'primary_conf': conf, 'source': 'static'})
 
 	# Primary motion detection
-	if primary_motion_classes[0] != '0' and model_motion != None:
+	if primary_motion_classes[0] != '0' and model_motion is not None:
 		results_motion = model_motion.predict(motion_image, conf=primary_conf_thresh, verbose=False)
 		for box in results_motion[0].boxes:
 			class_idx = int(box.cls[0])
 			primary_class = primary_motion_classes[class_idx]
 			conf = float(box.conf[0])
 			x1, y1, x2, y2 = map(int, box.xyxy[0])
+			all_detections.append({'coords': (x1, y1, x2, y2), 'primary_class': primary_class,
+									'primary_conf': conf, 'source': 'motion'})
 
-			if hierarchical_mode:
-				# crop and run secondary classifier on static image
+	# Merge static/motion detections of the same physical object, respecting dominant_source -
+	# shared with BehaveAI_classify_track.py/BehaveAI_live.py (box_geometry.py) so auto-annotate
+	# resolves conflicting static/motion detections the same way batch processing does
+	merged = bg.merge_source_detections(all_detections, centroid_merge_thresh, iou_thresh, dominant_source)
+
+	new_boxes = []
+	for det in merged:
+		x1, y1, x2, y2 = det['coords']
+		primary_class = det['primary_class']
+		conf = det['primary_conf']
+		source = det['source']
+		if source == 'static':
+			class_idx = primary_static_classes.index(primary_class)
+		else:
+			class_idx = len(primary_static_classes) + primary_motion_classes.index(primary_class)
+
+		if hierarchical_mode:
+			# prefer the secondary model matching this detection's own source, falling back to
+			# the other stream if it isn't configured - matches BehaveAI_classify_track.py
+			sec_model = None
+			crop_img = None
+			if source == 'static':
 				if len(secondary_static_classes) >= 2:
 					sec_model = secondary_static_models.get(primary_class, None)
-					sec_classes = secondary_static_classes
 					crop_img = fr
-				# Fallback to motion secondary model if static not available
 				elif len(secondary_motion_classes) >= 2:
 					sec_model = secondary_motion_models.get(primary_class, None)
-					sec_classes = secondary_motion_classes
 					crop_img = motion_image if primary_motion_classes[0] != '0' else fr
-
-				# Get the cropped region
-				crop = None
-				if crop_img is not None:
-					crop = crop_img[y1:y2, x1:x2]
-				
-				secondary_class = primary_class
-				secondary_conf = 1.0
-				secondary_class_idx = -1
-
-				# Run secondary classification if we have a model and valid crop
-				if sec_model and crop is not None and crop.size > 0:
-					sec_results = sec_model.predict(crop, verbose=False)
-					if sec_results[0].probs is not None:
-						secondary_class_idx = sec_results[0].probs.top1
-						secondary_conf = sec_results[0].probs.top1conf.item()
-						secondary_class = sec_model.names[secondary_class_idx]
-
-				boxes.append((x1, y1, x2, y2, class_idx + len(primary_static_classes), secondary_class_idx, conf, secondary_conf))#conf 1 & 2 need separating
-				
 			else:
-				boxes.append((x1, y1, x2, y2, class_idx + len(primary_static_classes), conf))
+				if len(secondary_motion_classes) >= 2:
+					sec_model = secondary_motion_models.get(primary_class, None)
+					crop_img = motion_image
+				elif len(secondary_static_classes) >= 2:
+					sec_model = secondary_static_models.get(primary_class, None)
+					crop_img = fr
 
-	if boxes:
-		boxes = non_max_suppression(boxes)
+			crop = crop_img[y1:y2, x1:x2] if crop_img is not None else None
+
+			secondary_conf = 1.0
+			secondary_class_idx = -1
+			if sec_model and crop is not None and crop.size > 0:
+				sec_results = sec_model.predict(crop, verbose=False)
+				if sec_results[0].probs is not None:
+					secondary_class_idx = sec_results[0].probs.top1
+					secondary_conf = sec_results[0].probs.top1conf.item()
+
+			new_boxes.append((x1, y1, x2, y2, class_idx, secondary_class_idx, conf, secondary_conf))
+		else:
+			new_boxes.append((x1, y1, x2, y2, class_idx, conf))
+
+	boxes = new_boxes
 
 
 
 # draw boxes onto a frame copy
-def draw_boxes_on_image(base_img):
+def _draw_oriented_boxes_on_image(out):
+	for box in boxes:
+		corners = bg.corners_from_head_tail_width(box['head'], box['tail'], box['width'])
+		primary_cls = box['cls']
+		pcol = primary_colors[primary_cls] if (primary_cls is not None and primary_cls < len(primary_colors)) else (255,255,255)
+		conf = box.get('conf', -1)
+
+		if hierarchical_mode:
+			secondary_cls = box.get('sec_cls', -1)
+			sec_conf = box.get('sec_conf', -1)
+			scol = secondary_colors[secondary_cls] if (secondary_cls is not None and secondary_cls != -1 and secondary_cls < len(secondary_colors)) else pcol
+
+			outer_th = max(1, line_thickness + 2)
+			outer_corners = bg.inset_corners(corners, -outer_th)
+			cv2.polylines(out, [np.array(outer_corners, dtype=np.int32)], True, pcol, outer_th, cv2.LINE_AA)
+
+			label = [(f"{primary_classes[primary_cls].upper()}", pcol)]
+			if conf != -1 and conf is not None:
+				try:
+					label[0] = (label[0][0] + f" {conf:.2f}", pcol)
+				except Exception:
+					pass
+
+			if primary_classes[primary_cls] not in ignore_secondary:
+				# Secondary box is nudged outward and drawn a shade thicker than a bare
+				# line_thickness so it isn't visually swallowed by the thicker primary ring.
+				inner_th = max(1, line_thickness + 1)
+				inner_corners = bg.inset_corners(corners, -1)
+				cv2.polylines(out, [np.array(inner_corners, dtype=np.int32)], True, scol, inner_th, cv2.LINE_AA)
+
+				if secondary_cls is not None and secondary_cls != -1 and secondary_cls < len(secondary_classes):
+					label2 = f" {secondary_classes[secondary_cls]}"
+					if sec_conf != -1 and sec_conf is not None:
+						try:
+							label2 = label2 + f" {sec_conf:.2f}"
+						except Exception:
+							pass
+					label.append((label2, scol))
+
+			cv2.circle(out, (int(box['head'][0]), int(box['head'][1])), int(max(3, line_thickness * 2) * 1.5), pcol, -1, cv2.LINE_AA)
+			anchor, angle_deg, align = bg.label_anchor_and_angle(corners, box['head'])
+			bg.draw_rotated_text(out, label, anchor, angle_deg, pcol, align=align, font_scale=font_size, thickness=line_thickness)
+		else:
+			label = f"{primary_classes[primary_cls]}"
+			if conf != -1 and conf is not None:
+				try:
+					label = label + f" {conf:.2f}"
+				except Exception:
+					pass
+			bg.draw_oriented_box(out, corners, box['head'], pcol, thickness=line_thickness, label=label, label_color=pcol)
+
+
+def _draw_temp_obb_preview(out, temp_obb):
+	stage, head, tail, cursor, width_value, shift_amount = temp_obb
+	if stage == 1 and head is not None and cursor is not None:
+		cv2.line(out, (int(head[0]), int(head[1])), (int(cursor[0]), int(cursor[1])), (255,255,255), max(1, line_thickness))
+		cv2.circle(out, (int(head[0]), int(head[1])), int(max(3, line_thickness * 2) * 1.5), (255,255,255), -1, cv2.LINE_AA)
+		# full-frame crosshair line orthogonal to the current head->cursor (candidate tail) axis,
+		# through the cursor - helps align the tail placement against the rest of the frame,
+		# matching the axis-aligned crosshair shown for square boxes
+		hx, hy = head
+		dx, dy = hx - cursor[0], hy - cursor[1]
+		length = (dx*dx + dy*dy) ** 0.5
+		if length > 1e-6:
+			perp = (-dy / length, dx / length)
+			clipped = bg.clip_line_to_rect(cursor, perp, video_width, video_height)
+			if clipped is not None:
+				(x1, y1), (x2, y2) = clipped
+				cv2.line(out, (int(x1), int(y1)), (int(x2), int(y2)), (255,255,255), max(1, line_thickness))
+	elif stage == 2 and head is not None and tail is not None:
+		draw_head, draw_tail = bg.shift_head_tail_sideways(head, tail, shift_amount)
+		corners = bg.corners_from_head_tail_width(draw_head, draw_tail, max(1.0, width_value))
+		bg.draw_oriented_box(out, corners, draw_head, (255,255,255), thickness=max(1, line_thickness))
+
+
+def draw_boxes_on_image(base_img, temp_obb=None):
 	"""
 	Draw hierarchical boxes onto a *copy* of base_img.
 	- Outer rectangle uses primary color (slightly thicker)
@@ -591,6 +743,17 @@ def draw_boxes_on_image(base_img):
 	- Label shows PRIMARY conf SECONDARY conf (primary uppercased)
 	"""
 	out = base_img.copy()
+
+	if oriented:
+		_draw_oriented_boxes_on_image(out)
+		if temp_obb is not None:
+			_draw_temp_obb_preview(out, temp_obb)
+		for gx1, gy1, gx2, gy2 in grey_boxes:
+			overlay = out.copy()
+			cv2.rectangle(overlay, (int(gx1), int(gy1)), (int(gx2), int(gy2)), (128,128,128), -1)
+			cv2.addWeighted(overlay, 0.5, out, 0.5, 0, out)
+		return out
+
 	for box in boxes:
 
 
@@ -609,35 +772,31 @@ def draw_boxes_on_image(base_img):
 			outer_th = max(1, line_thickness + 2)
 			cv2.rectangle(out, (int(x1)-outer_th, int(y1)-outer_th), (int(x2)+outer_th, int(y2)+outer_th), pcol, outer_th)
 
-			# draw inner box (secondary or primary)
+			# draw inner box (secondary or primary) - nudged outward and a shade thicker than a
+			# bare line_thickness so it isn't visually swallowed by the thicker primary ring.
 			if primary_classes[primary_cls] not in ignore_secondary:
-				cv2.rectangle(out, (int(x1), int(y1)), (int(x2), int(y2)), scol, line_thickness)
+				inner_th = max(1, line_thickness + 1)
+				cv2.rectangle(out, (int(x1)-1, int(y1)-1), (int(x2)+1, int(y2)+1), scol, inner_th)
 
-			# compose label: PRIMARY (upper) [+ conf], then secondary [+ conf]
-			label = f"{primary_classes[primary_cls].upper()}"
+			# compose label: PRIMARY (upper) [+ conf] in primary colour, then secondary [+ conf] in secondary colour
+			label_segments = [(f"{primary_classes[primary_cls].upper()}", pcol)]
 			if conf != -1 and conf is not None:
 				try:
-					label = label + f" {conf:.2f}"
+					label_segments[0] = (label_segments[0][0] + f" {conf:.2f}", pcol)
 				except Exception:
 					pass
-			
-			if primary_classes[primary_cls] not in ignore_secondary:	
+
+			if primary_classes[primary_cls] not in ignore_secondary:
 				if secondary_cls is not None and secondary_cls != -1 and secondary_cls < len(secondary_classes):
-					label2 = f"{secondary_classes[secondary_cls]}"
+					label2 = f" {secondary_classes[secondary_cls]}"
 					if sec_conf != -1 and sec_conf is not None:
 						try:
 							label2 = label2 + f" {sec_conf:.2f}"
 						except Exception:
 							pass
-					label = label + " " + label2
+					label_segments.append((label2, scol))
 
-			# draw label background and text
-			label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_size, line_thickness)
-			label_w, label_h = label_size
-			lx, ly = int(x1), int(y1)
-			cv2.rectangle(out, (lx - line_thickness, ly - label_h - line_thickness*4), (lx + label_w + line_thickness*2, ly), (0,0,0), -1)
-			# ~ cv2.putText(out, label, (lx, ly - line_thickness*2), cv2.FONT_HERSHEY_SIMPLEX, font_size, scol, line_thickness, cv2.LINE_AA)
-			cv2.putText(out, label, (lx, ly - line_thickness*2), cv2.FONT_HERSHEY_SIMPLEX, font_size, pcol, line_thickness, cv2.LINE_AA)
+			bg.draw_label_with_background(out, label_segments, int(x1), int(y1), font_size, line_thickness)
 
 		else:
 			x1, y1, x2, y2, primary_cls, conf = box
@@ -660,9 +819,152 @@ def draw_boxes_on_image(base_img):
 	return out
 	
 	
+def _save_ornt_crops(box, primary_class_name, motion_ann_frame, static_ann_frame):
+	"""Save whole-crop orientation-classifier training images for one box: the correctly-oriented
+	upright crop (head-left, tail-right) as a 'correct' example, plus its 90/180/270-degree
+	rotations as 'null' examples. Whole-crop (not head-vs-tail half-crop) so the classifier can
+	use the entire animal's shape/appearance to judge orientation, not just a local head/tail
+	feature - useful when there's no single obviously distinct 'head' marking to compare halves
+	on. Independent of hierarchical_mode - this is a per-primary-class feature, not per-secondary-class."""
+	head, tail, width = box['head'], box['tail'], box['width']
+	for base_dir, src_frame in ((motion_ornt_base_dir, motion_ann_frame), (static_ornt_base_dir, static_ann_frame)):
+		upright = bg.crop_rotated_upright(src_frame, head, tail, width)
+		if upright is None or upright.size == 0:
+			continue
+		correct_dir = os.path.join(base_dir, primary_class_name, 'correct')
+		os.makedirs(correct_dir, exist_ok=True)
+		cv2.imwrite(os.path.join(correct_dir, f"{video_label}_{frame_number}.jpg"), upright)
+
+		null_dir = os.path.join(base_dir, primary_class_name, 'null')
+		os.makedirs(null_dir, exist_ok=True)
+		for i, rotated in enumerate(bg.rotate_90_variants(upright)):
+			cv2.imwrite(os.path.join(null_dir, f"{video_label}_{frame_number}_{i}.jpg"), rotated)
+
+
+def _save_annotation_oriented():
+	global annot_count
+	randVal = random.random()
+	is_val = randVal < val_frequency
+
+	motion_target_img_dir = motion_val_images_dir if is_val else motion_train_images_dir
+	motion_target_lbl_dir = motion_val_labels_dir if is_val else motion_train_labels_dir
+	static_target_img_dir = static_val_images_dir if is_val else static_train_images_dir
+	static_target_lbl_dir = static_val_labels_dir if is_val else static_train_labels_dir
+	annot_type = 'validation' if is_val else 'training'
+
+	motion_ann_frame = original_frame.copy()
+	for gx1, gy1, gx2, gy2 in grey_boxes:
+		cv2.rectangle(motion_ann_frame, (gx1, gy1), (gx2, gy2), (128, 128, 128), -line_thickness)
+
+	static_ann_frame = fr.copy()
+	for gx1, gy1, gx2, gy2 in grey_boxes:
+		cv2.rectangle(static_ann_frame, (gx1, gy1), (gx2, gy2), (128, 128, 128), -line_thickness)
+
+	static_count = 0
+	motion_count = 0
+
+	for box in boxes:
+		primary_cls = box['cls']
+		corners = bg.corners_from_head_tail_width(box['head'], box['tail'], box['width'])
+		poly = np.array(corners, dtype=np.int32)
+		if primary_cls < len(primary_static_classes):
+			static_count += 1
+			if static_blocks_motion == 'true':
+				cv2.fillPoly(motion_ann_frame, [poly], (128, 128, 128))
+		else:
+			motion_count += 1
+			if motion_blocks_static == 'true':
+				cv2.fillPoly(static_ann_frame, [poly], (128, 128, 128))
+
+	h, w = original_frame.shape[:2]
+	base_filename = f"{video_label}_{frame_number}"
+
+	deleted = annotation_index.delete_frame(base_filename)
+	if deleted:
+		print("Overwriting existing annotation")
+
+	if static_count > 0 or save_empty_frames == 'true':
+		cv2.imwrite(os.path.join(static_target_img_dir, f"{base_filename}.jpg"), static_ann_frame)
+		with open(os.path.join(static_target_lbl_dir, f"{base_filename}.txt"), 'w') as f:
+			for box in boxes:
+				if box['cls'] < len(primary_static_classes):
+					corners = bg.corners_from_head_tail_width(box['head'], box['tail'], box['width'])
+					corners_n = bg.norm_corners(corners, w, h)
+					f.write(bg.write_label_line({'cls': box['cls'], 'corners_n': corners_n}, oriented=True))
+
+	if motion_count > 0 or save_empty_frames == 'true':
+		cv2.imwrite(os.path.join(motion_target_img_dir, f"{base_filename}.jpg"), motion_ann_frame)
+		with open(os.path.join(motion_target_lbl_dir, f"{base_filename}.txt"), 'w') as f:
+			for box in boxes:
+				if box['cls'] >= len(primary_static_classes):
+					corners = bg.corners_from_head_tail_width(box['head'], box['tail'], box['width'])
+					corners_n = bg.norm_corners(corners, w, h)
+					cls_in_file = box['cls'] - len(primary_static_classes)
+					f.write(bg.write_label_line({'cls': cls_in_file, 'corners_n': corners_n}, oriented=True))
+
+	if static_blocks_motion == 'true':
+		motion_ann_frame = original_frame.copy()
+		for gx1, gy1, gx2, gy2 in grey_boxes:
+			cv2.rectangle(motion_ann_frame, (gx1, gy1), (gx2, gy2), (128, 128, 128), -line_thickness)
+
+	if motion_blocks_static == 'true':
+		static_ann_frame = fr.copy()
+		for gx1, gy1, gx2, gy2 in grey_boxes:
+			cv2.rectangle(static_ann_frame, (gx1, gy1), (gx2, gy2), (128, 128, 128), -line_thickness)
+
+	for box in boxes:
+		primary_cls = box['cls']
+		primary_class_name = primary_classes[primary_cls]
+		corners = bg.corners_from_head_tail_width(box['head'], box['tail'], box['width'])
+		x1, y1, _, _ = bg.axis_aligned_bounds(corners)
+
+		if hierarchical_mode:
+			secondary_cls = box.get('sec_cls', -1)
+			if secondary_cls is not None and secondary_cls != -1:
+				secondary_class_name = secondary_classes[secondary_cls]
+
+				motion_crop = bg.crop_black_masked(motion_ann_frame, corners)
+				if motion_crop is not None and motion_crop.size > 0:
+					motion_class_dir = os.path.join(motion_cropped_base_dir, primary_class_name, secondary_class_name)
+					os.makedirs(motion_class_dir, exist_ok=True)
+					cv2.imwrite(os.path.join(motion_class_dir, f"{video_label}_{frame_number}_{x1}_{y1}.jpg"), motion_crop)
+
+				static_crop = bg.crop_black_masked(static_ann_frame, corners)
+				if static_crop is not None and static_crop.size > 0:
+					static_class_dir = os.path.join(static_cropped_base_dir, primary_class_name, secondary_class_name)
+					os.makedirs(static_class_dir, exist_ok=True)
+					cv2.imwrite(os.path.join(static_class_dir, f"{video_label}_{frame_number}_{x1}_{y1}.jpg"), static_crop)
+
+		if oriented:
+			# always saved for oriented projects, regardless of disambiguate_head_tail, so the
+			# training data is already there if the user later switches this setting on
+			_save_ornt_crops(box, primary_class_name, motion_ann_frame, static_ann_frame)
+
+	static_mask_dir = static_target_lbl_dir.replace('labels', 'masks')
+	motion_mask_dir = motion_target_lbl_dir.replace('labels', 'masks')
+	os.makedirs(static_mask_dir, exist_ok=True)
+	os.makedirs(motion_mask_dir, exist_ok=True)
+
+	mask_content = ""
+	for gx1, gy1, gx2, gy2 in grey_boxes:
+		mask_content += f"{gx1} {gy1} {gx2} {gy2}\n"
+
+	mask_filename = f"{base_filename}.mask.txt"
+	with open(os.path.join(static_mask_dir, mask_filename), 'w') as f:
+		f.write(mask_content)
+	with open(os.path.join(motion_mask_dir, mask_filename), 'w') as f:
+		f.write(mask_content)
+
+	print(f"Saved #{annot_count} frame {frame_number} -> {annot_type}")
+	annot_count += 1
+
+
 def save_annotation():
 	global annot_count
 	if original_frame is None or (not boxes and not grey_boxes) and save_empty_frames == 'false':
+		return
+	if oriented:
+		_save_annotation_oriented()
 		return
 	# randomly assign to valdiation
 	randVal = random.random()
@@ -968,6 +1270,22 @@ class AnnotatorTk:
 		self.drawing = False
 		self.start_canvas_xy = None
 
+		# oriented-box 3-click draw state (head -> tail -> width)
+		self.obb_stage = 0
+		self.obb_head = None
+		self.obb_tail = None
+		self.obb_shift_held = False
+		# perpendicular cursor distance from the centre line drives width normally, or - while
+		# Shift is held - drives the sideways shift instead; each is frozen while the other is
+		# active. Driven by the CHANGE in cursor distance since a mode was last (re)entered
+		# (tracked via the *_dist_offset anchors below), not the absolute distance, so toggling
+		# Shift mid-drag doesn't snap the box to wherever the cursor happens to be.
+		self.obb_width_value = 0.0
+		self.obb_shift_amount = 0.0
+		self.obb_width_dist_offset = 0.0
+		self.obb_shift_dist_offset = 0.0
+		self.obb_prev_shift_held = False
+
 		# small layout tuning: padding between main and zoom column when composing
 		self._composite_gap = 8
 
@@ -1161,9 +1479,82 @@ class AnnotatorTk:
 
 	# drawing handlers
 	def on_mouse_down(self, event):
+		if oriented and not grey_mode:
+			self.on_obb_click(event)
+			return
 		self.drawing = True
 		self.start_canvas_xy = (event.x, event.y)
 		self.last_mouse = (event.x, event.y)
+
+	def on_obb_click(self, event):
+		"""3-click oriented-box draw flow: click1=head, click2=tail, click3=width (commit)."""
+		v = self.canvas_to_video((event.x, event.y))
+		v = (max(0, min(video_width - 1, v[0])), max(0, min(video_height - 1, v[1])))
+		if self.obb_stage == 0:
+			self.obb_head = v
+			self.obb_stage = 1
+		elif self.obb_stage == 1:
+			self.obb_tail = v
+			self.obb_stage = 2
+			self.obb_width_value = 0.0
+			self.obb_shift_amount = 0.0
+			self.obb_width_dist_offset = 0.0
+			self.obb_shift_dist_offset = 0.0
+			self.obb_prev_shift_held = False
+		elif self.obb_stage == 2:
+			self.obb_shift_held = bool(event.state & 0x1)
+			self._update_obb_width_or_shift(v)
+			width = self.obb_width_value
+			if width >= 2:
+				final_head, final_tail = bg.shift_head_tail_sideways(self.obb_head, self.obb_tail, self.obb_shift_amount)
+				if hierarchical_mode:
+					boxes.append({'head': final_head, 'tail': final_tail, 'width': width,
+								  'cls': active_primary, 'sec_cls': active_secondary, 'conf': -1, 'sec_conf': -1})
+				else:
+					boxes.append({'head': final_head, 'tail': final_tail, 'width': width,
+								  'cls': active_primary, 'conf': -1})
+			self.obb_stage = 0
+			self.obb_head = None
+			self.obb_tail = None
+		self.redraw()
+
+	def _update_obb_width_or_shift(self, cursor):
+		"""Stage 2: the perpendicular distance from `cursor` to the (original, un-shifted) head-tail
+		line drives WIDTH normally, or - while Shift is held - drives the sideways SHIFT instead.
+		Whichever one isn't currently active is left frozen at its last value. Each is advanced by
+		the CHANGE in cursor distance since its mode was last (re)entered (not the raw absolute
+		distance) so that toggling Shift mid-drag doesn't snap the box to wherever the cursor
+		currently is - the *_dist_offset anchors are reset to the cursor's current distance the
+		instant a mode switch is detected, making that switch a zero-delta (no-jump) event."""
+		if self.obb_stage != 2 or self.obb_head is None or self.obb_tail is None:
+			return
+		signed = bg.signed_perpendicular_distance(self.obb_head, self.obb_tail, cursor)
+		if self.obb_shift_held != self.obb_prev_shift_held:
+			if self.obb_shift_held:
+				self.obb_shift_dist_offset = signed
+			else:
+				self.obb_width_dist_offset = abs(signed)
+			self.obb_prev_shift_held = self.obb_shift_held
+		if self.obb_shift_held:
+			self.obb_shift_amount += signed - self.obb_shift_dist_offset
+			self.obb_shift_dist_offset = signed
+		else:
+			dist = abs(signed)
+			self.obb_width_value = max(0.0, self.obb_width_value + 2.0 * (dist - self.obb_width_dist_offset))
+			self.obb_width_dist_offset = dist
+
+	def cancel_obb_draw(self):
+		if self.obb_stage != 0:
+			self.obb_stage = 0
+			self.obb_head = None
+			self.obb_tail = None
+			self.obb_width_value = 0.0
+			self.obb_shift_amount = 0.0
+			self.obb_width_dist_offset = 0.0
+			self.obb_shift_dist_offset = 0.0
+			self.obb_prev_shift_held = False
+			return True
+		return False
 
 	def on_mouse_drag(self, event):
 		if not self.drawing:
@@ -1192,22 +1583,35 @@ class AnnotatorTk:
 		self.redraw()
 
 	def on_right_click(self, event):
+		if oriented and self.cancel_obb_draw():
+			self.redraw()
+			return
 		v = self.canvas_to_video((event.x, event.y))
 		x, y = int(v[0]), int(v[1])
 		removed = False
 		for i in range(len(boxes)-1, -1, -1):
-			bx1, by1, bx2, by2 = boxes[i][0], boxes[i][1], boxes[i][2], boxes[i][3]
-			if bx1 <= x <= bx2 and by1 <= y <= by2:
+			if oriented:
+				corners = bg.corners_from_head_tail_width(boxes[i]['head'], boxes[i]['tail'], boxes[i]['width'])
+				hit = bg.point_in_corners(x, y, corners)
+			else:
+				bx1, by1, bx2, by2 = boxes[i][0], boxes[i][1], boxes[i][2], boxes[i][3]
+				hit = bx1 <= x <= bx2 and by1 <= y <= by2
+			if hit:
 				del boxes[i]; removed = True; break
 		if not removed:
 			for i in range(len(grey_boxes)-1, -1, -1):
 				gx1, gy1, gx2, gy2 = grey_boxes[i]
 				if gx1 <= x <= gx2 and gy1 <= y <= gy2:
 					del grey_boxes[i]; break
-		self.redraw()
+		try:
+			self.redraw()
+		except Exception:
+			print("Error redrawing after right-click delete:")
+			traceback.print_exc()
 
 	def on_motion(self, event):
 		self.last_mouse = (event.x, event.y)
+		self.obb_shift_held = bool(event.state & 0x1)
 		self.redraw()
 
 	# keyboard
@@ -1216,6 +1620,11 @@ class AnnotatorTk:
 
 		ch = event.char
 		ks = event.keysym
+
+		if ks == 'Escape':
+			if oriented and self.cancel_obb_draw():
+				self.redraw()
+			return
 
 		# Frame step - step larger when Shift is held (event.state & 0x1 tests Shift mask)
 		# Support CTRL + Left/Right to jump to previous/next annotated frame (event.state & 0x4 tests CTRL mask on X11)
@@ -1386,7 +1795,17 @@ class AnnotatorTk:
 			base = motion_image.copy() if motion_image is not None else np.zeros((video_height, video_width, 3), dtype=np.uint8)
 	
 		# draw boxes/grey boxes onto base (works in video/native coords)
-		display = draw_boxes_on_image(base)
+		temp_obb = None
+		if oriented and self.obb_stage in (1, 2) and self.last_mouse is not None:
+			try:
+				cursor_v = self.canvas_to_video(self.last_mouse)
+			except Exception:
+				cursor_v = None
+			if cursor_v is not None:
+				if self.obb_stage == 2:
+					self._update_obb_width_or_shift(cursor_v)
+				temp_obb = (self.obb_stage, self.obb_head, self.obb_tail, cursor_v, self.obb_width_value, self.obb_shift_amount)
+		display = draw_boxes_on_image(base, temp_obb=temp_obb)
 	
 		# initial desired main display size (before final uniform scaling)
 		disp_w = max(1, int(self.display_size[0]))
@@ -1560,10 +1979,12 @@ class AnnotatorTk:
 
 
 		# draw crosshair — but *limit* it to the main display area so it doesn't cross into the zoom column
+		# (skipped in oriented mode: the angled head/tail-axis crosshair replaces it there - see
+		# _draw_temp_obb_preview - the zoom-pane crosshairs below are unaffected)
 		scaled_disp_w = max(1, int(round(disp_w * scale)))
 		scaled_disp_h = max(1, int(round(disp_h * scale)))
-		
-		if self.last_mouse is not None:
+
+		if not oriented and self.last_mouse is not None:
 			mx, my = self.last_mouse
 			# only draw if the mouse is inside the scaled main-display region
 			if 0 <= mx < scaled_disp_w and 0 <= my < scaled_disp_h:
@@ -1601,6 +2022,18 @@ class AnnotatorTk:
 	
 
 	def loop(self):
+		# The self-rescheduling after(30, self.loop) call must always run, even if
+		# _loop_body() raises - otherwise the canvas silently stops refreshing forever
+		# (Tk's default callback-exception handler just prints and swallows the error,
+		# so an unhandled exception here previously killed the redraw loop for good).
+		try:
+			self._loop_body()
+		except Exception:
+			print("Error in redraw loop:")
+			traceback.print_exc()
+		self.root.after(30, self.loop)
+
+	def _loop_body(self):
 		global frame_updated, fr, original_frame, motion_image, raw_buf, last_mouse_move, last_anim_draw, boxes, grey_boxes
 
 		need_ = False
@@ -1610,7 +2043,15 @@ class AnnotatorTk:
 			frame_updated = False
 			boxes.clear(); grey_boxes.clear()
 			last_frame = frame_number
-			start_frame = last_frame - frameWindow + 1
+			# Sample every `step` frames so the LAST sampled (kept) frame lands exactly on
+			# last_frame - matches the base_N/step math in Regenerate_annotations.py and
+			# BehaveAI_inspect_dataset.py. The previous `last_frame - frameWindow + 1` start
+			# (frameWindow already being base_N*step) put the final "keep" slot frame_skip
+			# frames short of last_frame whenever frame_skip > 0, so the image actually shown/
+			# saved for a given frame_number was really frame_number - frame_skip.
+			step = frame_skip + 1
+			base_N = raw_buf.maxlen
+			start_frame = last_frame - (base_N - 1) * step
 			if start_frame < 0:
 				original_frame = np.zeros((video_height, video_width, 3), dtype=np.uint8)
 				fr = original_frame.copy()
@@ -1623,7 +2064,7 @@ class AnnotatorTk:
 				motion_image = None
 				frame_count = 0
 				raw_buf.clear()
-				for i in range(frameWindow):
+				for i in range((base_N - 1) * step + 1):
 					ret, raw_frame = capture.read()
 					if not ret:
 						break
@@ -1707,13 +2148,10 @@ class AnnotatorTk:
 		if need_:
 			self.redraw()
 
-
-		self.root.after(30, self.loop)
-
 # Launch app
 root = tk.Tk()
 app = AnnotatorTk(root)
 root.mainloop()
 
 capture.release()
-print("Done annotating video.")
+print(f"Done annotating {video_label}")

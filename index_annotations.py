@@ -5,6 +5,7 @@
 import os
 import cv2
 import numpy as np
+import box_geometry as bg
 
 class AnnotationIndex:
 	def __init__(
@@ -24,7 +25,8 @@ class AnnotationIndex:
 		primary_classes,
 		secondary_classes,
 		hierarchical_mode,
-		ignore_secondary=None
+		ignore_secondary=None,
+		oriented=False
 	):
 		# directories
 		self.static_train_images_dir = static_train_images_dir
@@ -45,6 +47,7 @@ class AnnotationIndex:
 		self.secondary_classes = list(secondary_classes) if secondary_classes is not None else []
 		self.hierarchical_mode = bool(hierarchical_mode)
 		self.ignore_secondary = set(ignore_secondary or [])
+		self.oriented = bool(oriented)
 
 
 
@@ -129,21 +132,11 @@ class AnnotationIndex:
 			try:
 				with open(static_lbl, 'r') as f:
 					for line in f:
-						parts = line.strip().split()
-						if len(parts) < 5:
-							continue
-						cls = int(parts[0])
-						xc, yc, bw, bh = parts[1:5]
-						if fr is None:
-							# can't compute pixel coords; skip
+						parsed = bg.read_label_line(line, self.oriented)
+						if parsed is None or fr is None:
 							continue
 						h, w = fr.shape[:2]
-						x1, y1, x2, y2 = self._norm_to_pixels(xc, yc, bw, bh, w, h)
-						if self.hierarchical_mode:
-							# use -1 for "no secondary assigned"
-							boxes.append((x1, y1, x2, y2, cls, -1, -1, -1))
-						else:
-							boxes.append((x1, y1, x2, y2, cls, -1))
+						boxes.append(self._build_loaded_box(parsed, w, h))
 			except Exception:
 				pass
 
@@ -153,20 +146,12 @@ class AnnotationIndex:
 			try:
 				with open(motion_lbl, 'r') as f:
 					for line in f:
-						parts = line.strip().split()
-						if len(parts) < 5:
-							continue
-						cls = int(parts[0])
-						xc, yc, bw, bh = parts[1:5]
-						if original_frame is None:
+						parsed = bg.read_label_line(line, self.oriented)
+						if parsed is None or original_frame is None:
 							continue
 						h, w = original_frame.shape[:2]
-						x1, y1, x2, y2 = self._norm_to_pixels(xc, yc, bw, bh, w, h)
-						global_primary_cls = cls + len(self.primary_static_classes)
-						if self.hierarchical_mode:
-							boxes.append((x1, y1, x2, y2, global_primary_cls, -1, -1, -1))
-						else:
-							boxes.append((x1, y1, x2, y2, global_primary_cls, -1))
+						parsed['cls'] += len(self.primary_static_classes)
+						boxes.append(self._build_loaded_box(parsed, w, h))
 			except Exception:
 				pass
 
@@ -243,13 +228,34 @@ class AnnotationIndex:
 	# Attach secondary crop matches to boxes (in-place semantics via returning a new list)
 	# Implementation follows the inspector behaviour (exact match then small neighbourhood)
 	# ------------------------------------------------------------------
+	def _box_bbox_topleft_and_cls(self, b):
+		"""Return (x1, y1, primary_cls) for a box - used as the secondary-crop match key.
+		x1,y1 is the axis-aligned bounding-rect top-left corner for both box shapes, matching
+		the coordinate the crop filename was written with (see box_geometry.axis_aligned_bounds)."""
+		if self.oriented:
+			corners = bg.corners_from_head_tail_width(b['head'], b['tail'], b['width'])
+			x1, y1, _, _ = bg.axis_aligned_bounds(corners)
+			return x1, y1, b['cls']
+		return int(round(b[0])), int(round(b[1])), (b[4] if len(b) > 4 else None)
+
+	def _apply_secondary_match(self, boxes, bi, sec_idx):
+		if self.oriented:
+			boxes[bi]['sec_cls'] = sec_idx
+			return
+		b = boxes[bi]
+		if len(b) >= 8:
+			boxes[bi] = (b[0], b[1], b[2], b[3], b[4], sec_idx, b[6], b[7])
+		else:
+			primary_cls = b[4] if len(b) > 4 else 0
+			conf = b[6] if len(b) > 6 else -1
+			boxes[bi] = (b[0], b[1], b[2], b[3], primary_cls, sec_idx, conf, -1)
+
 	def _attach_secondary_crops(self, item, boxes):
 		MATCH_TOL = 2
 		# build map by (x1, y1, primary_name) -> list of box indices
 		box_index = {}
 		for bi, b in enumerate(boxes):
-			bx1 = int(round(b[0])); by1 = int(round(b[1]))
-			primary_idx = b[4] if len(b) > 4 else None
+			bx1, by1, primary_idx = self._box_bbox_topleft_and_cls(b)
 			primary_name = self.primary_classes[primary_idx] if primary_idx is not None and primary_idx < len(self.primary_classes) else None
 			key = (bx1, by1, primary_name)
 			box_index.setdefault(key, []).append(bi)
@@ -297,13 +303,7 @@ class AnnotationIndex:
 						matched = False
 						if key in box_index:
 							for bi in box_index[key]:
-								b = boxes[bi]
-								if len(b) >= 8:
-									boxes[bi] = (b[0], b[1], b[2], b[3], b[4], sec_idx, b[6], b[7])
-								else:
-									primary_cls = b[4] if len(b) > 4 else 0
-									conf = b[6] if len(b) > 6 else -1
-									boxes[bi] = (b[0], b[1], b[2], b[3], primary_cls, sec_idx, conf, -1)
+								self._apply_secondary_match(boxes, bi, sec_idx)
 								matched = True
 						if matched:
 							continue
@@ -314,13 +314,7 @@ class AnnotationIndex:
 								cand = (x1_fn + dx, y1_fn + dy, primary_name)
 								if cand in box_index:
 									for bi in box_index[cand]:
-										b = boxes[bi]
-										if len(b) >= 8:
-											boxes[bi] = (b[0], b[1], b[2], b[3], b[4], sec_idx, b[6], b[7])
-										else:
-											primary_cls = b[4] if len(b) > 4 else 0
-											conf = b[6] if len(b) > 6 else -1
-											boxes[bi] = (b[0], b[1], b[2], b[3], primary_cls, sec_idx, conf, -1)
+										self._apply_secondary_match(boxes, bi, sec_idx)
 										matched = True
 										break
 									if matched: break
@@ -338,6 +332,23 @@ class AnnotationIndex:
 		x2 = int(cx + bw_p/2); y2 = int(cy + bh_p/2)
 		x1 = max(0, min(w-1, x1)); y1 = max(0, min(h-1, y1)); x2 = max(0, min(w-1, x2)); y2 = max(0, min(h-1, y2))
 		return x1, y1, x2, y2
+
+	def _build_loaded_box(self, parsed, w, h):
+		"""Turn a parsed label-line dict into the in-memory box representation
+		(tuple for axis-aligned, dict for oriented - see box_geometry / annotation tools)."""
+		cls = parsed['cls']
+		if self.oriented:
+			corners = bg.denorm_corners(parsed['corners_n'], w, h)
+			head, tail, width = bg.head_tail_width_from_corners(corners)
+			box = {'head': head, 'tail': tail, 'width': width, 'cls': cls, 'conf': -1}
+			if self.hierarchical_mode:
+				box['sec_cls'] = -1
+				box['sec_conf'] = -1
+			return box
+		x1, y1, x2, y2 = self._norm_to_pixels(parsed['xc'], parsed['yc'], parsed['bw'], parsed['bh'], w, h)
+		if self.hierarchical_mode:
+			return (x1, y1, x2, y2, cls, -1, -1, -1)
+		return (x1, y1, x2, y2, cls, -1)
 
 	# ------------------------------------------------------------------
 	# Delete all saved files for a basename (labels, masks, images, original motion images,

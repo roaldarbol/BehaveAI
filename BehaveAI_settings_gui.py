@@ -33,6 +33,30 @@ CLASSIFIER_OPTIONS = [
 	'yolov8n.pt', 'yolov8s.pt', 'yolov8m.pt', 'yolov8l.pt',
 ]
 
+OBB_CLASSIFIER_OPTIONS = [m.replace('.pt', '-obb.pt') for m in CLASSIFIER_OPTIONS]
+
+BOX_SHAPE_CHOICES = ['boxes', 'oriented boxes', 'oriented boxes with angles']
+
+
+def box_shape_choice_to_ini(choice):
+	"""Map a Box shape dropdown choice to (box_shape_ini, disambiguate_head_tail_bool).
+
+	The two oriented choices both use box_shape_ini='oriented' - they share the exact same
+	label/annotation format and training data (including head/tail crops, which are always
+	saved for oriented projects regardless of this setting). Only 'with angles' additionally
+	trains and deploys the head/tail disambiguation classifier."""
+	if choice == 'boxes':
+		return 'boxes', False
+	if choice == 'oriented boxes with angles':
+		return 'oriented', True
+	return 'oriented', False
+
+
+def box_shape_choice_from_ini(box_shape_ini, disambiguate_head_tail):
+	if box_shape_ini != 'oriented':
+		return 'boxes'
+	return 'oriented boxes with angles' if disambiguate_head_tail else 'oriented boxes'
+
 RESERVED_HOTKEYS = {'u', 'g'}
 
 DEFAULT_CLASS_COLORS = [
@@ -507,6 +531,20 @@ class SettingsEditorApp(tk.Tk):
 		
 		return True, ""
 
+	def _validate_box_shape_classifier(self):
+		oriented = self.box_shape_var.get() != 'boxes'
+		classifier = self.primary_classifier_var.get()
+		is_obb_weights = classifier.endswith('-obb.pt')
+		if oriented and not is_obb_weights:
+			return (f"Box shape is set to '{self.box_shape_var.get()}' but the primary classifier "
+					f"('{classifier}') does not look like an OBB weights file (expected it to "
+					f"end in '-obb.pt'). Training will likely produce a normal-box model instead.")
+		if not oriented and is_obb_weights:
+			return (f"Box shape is set to 'boxes' but the primary classifier ('{classifier}') "
+					f"looks like an OBB weights file. Training will likely fail or produce an "
+					f"incompatible model.")
+		return None
+
 	def _confirm_modify_structure(self):
 		"""
 		Return True to allow structural changes (add/remove/clear), False to block.
@@ -525,6 +563,72 @@ class SettingsEditorApp(tk.Tk):
 			)
 			return messagebox.askyesno("Warning: existing annotations detected", msg)
 		return True
+
+	def _on_box_shape_changed(self, *args):
+		self._update_box_shape_dependent_widgets()
+		self._set_dirty()
+
+	def _update_box_shape_dependent_widgets(self):
+		oriented = self.box_shape_var.get() != 'boxes'
+		self.primary_classifier_combo['values'] = OBB_CLASSIFIER_OPTIONS if oriented else CLASSIFIER_OPTIONS
+		current = self.primary_classifier_var.get()
+		if oriented and current and not current.endswith('-obb.pt'):
+			base = current[:-3] if current.endswith('.pt') else current
+			self.primary_classifier_var.set(base + '-obb.pt')
+		elif not oriented and current.endswith('-obb.pt'):
+			self.primary_classifier_var.set(current[:-len('-obb.pt')] + '.pt')
+
+	def _has_existing_primary_models(self):
+		for name in ('model_primary_static', 'model_primary_motion'):
+			if os.path.isdir(os.path.join(self.project_dir, name)):
+				return True
+		return False
+
+	def _box_shape_changed(self):
+		"""True only when the underlying label/annotation FORMAT changed (boxes <-> oriented).
+		Switching between the two oriented choices ('oriented boxes' / 'oriented boxes with
+		angles') does NOT count - they share the same format and training data, so no backup
+		or regeneration is needed; it only changes whether the head/tail model is trained."""
+		if not hasattr(self, '_loaded_box_shape'):
+			return False
+		new_box_shape_ini, _ = box_shape_choice_to_ini(self.box_shape_var.get())
+		return self._loaded_box_shape != new_box_shape_ini
+
+	def _backup_for_box_shape_change(self):
+		"""Back up annotation/model directories whose format is tied to box_shape.
+
+		Unlike _backup_primary_and_secondary_motion_models (which only handles motion
+		re-generation), a box_shape change invalidates label *format* itself, so both
+		static and motion annotations/models must be moved aside - regeneration alone
+		cannot fix a 5-field vs 9-field label mismatch.
+		"""
+		backed = []
+		fixed_dirs = [
+			'annot_static', 'annot_motion',
+			'annot_static_crop', 'annot_motion_crop',
+			'annot_static_ornt', 'annot_motion_ornt',
+			'model_primary_static', 'model_primary_motion',
+		]
+		for name in fixed_dirs:
+			path = os.path.join(self.project_dir, name)
+			if os.path.isdir(path):
+				b = self._backup_dir(path)
+				if b:
+					backed.append(b)
+
+		backup_suffix_re = re.compile(r'_backup\d+$')
+		prefixes = ('model_secondary_static', 'model_secondary_motion', 'model_ornt_static', 'model_ornt_motion')
+		for name in sorted(os.listdir(self.project_dir)):
+			if not name.startswith(prefixes):
+				continue
+			if backup_suffix_re.search(name):
+				continue
+			path = os.path.join(self.project_dir, name)
+			if os.path.isdir(path):
+				b = self._backup_dir(path)
+				if b:
+					backed.append(b)
+		return backed
 
 	def _build_ui(self):
 		# top toolbar: load file
@@ -613,44 +717,52 @@ class SettingsEditorApp(tk.Tk):
 		tab3 = ttk.Frame(notebook)
 		notebook.add(tab3, text='Model type')
 
-		ttk.Label(tab3, text='Validation frequency').grid(row=0, column=0, sticky='w', padx=8, pady=(8,0))
-		self.val_frequency_var = tk.DoubleVar(value=0.2)
-		ttk.Spinbox(tab3, from_=0.0, to=1.0, increment=0.01, textvariable=self.val_frequency_var, width=6, command=self._set_dirty).grid(row=0, column=1, sticky='w', padx=8)
+		ttk.Label(tab3, text='Box shape').grid(row=0, column=0, sticky='w', padx=8, pady=(8,0))
+		self.box_shape_var = tk.StringVar(value='boxes')
+		ttk.Combobox(tab3, values=BOX_SHAPE_CHOICES, textvariable=self.box_shape_var, state='readonly').grid(row=0, column=1, sticky='w', padx=8, pady=(8,0))
+		self.box_shape_var.trace_add('write', self._on_box_shape_changed)
 
-		ttk.Label(tab3, text='Primary classifier').grid(row=1, column=0, sticky='w', padx=8, pady=(8,0))
+		ttk.Label(tab3, text='Validation frequency').grid(row=1, column=0, sticky='w', padx=8, pady=(8,0))
+		self.val_frequency_var = tk.DoubleVar(value=0.2)
+		ttk.Spinbox(tab3, from_=0.0, to=1.0, increment=0.01, textvariable=self.val_frequency_var, width=6, command=self._set_dirty).grid(row=1, column=1, sticky='w', padx=8)
+
+		ttk.Label(tab3, text='Primary classifier').grid(row=2, column=0, sticky='w', padx=8, pady=(8,0))
 		self.primary_classifier_var = tk.StringVar(value='yolo26n.pt')
-		ttk.Combobox(tab3, values=CLASSIFIER_OPTIONS, textvariable=self.primary_classifier_var).grid(row=1, column=1, sticky='w', padx=8, pady=(8,0))
+		self.primary_classifier_combo = ttk.Combobox(tab3, values=CLASSIFIER_OPTIONS, textvariable=self.primary_classifier_var)
+		self.primary_classifier_combo.grid(row=2, column=1, sticky='w', padx=8, pady=(8,0))
 		self.primary_classifier_var.trace_add('write', lambda *a: self._set_dirty())
 
-		ttk.Label(tab3, text='Primary epochs').grid(row=2, column=0, sticky='w', padx=8, pady=(6,0))
+		ttk.Label(tab3, text='Primary epochs').grid(row=3, column=0, sticky='w', padx=8, pady=(6,0))
 		self.primary_epochs_var = tk.IntVar(value=100)
-		ttk.Spinbox(tab3, from_=1, to=10000, textvariable=self.primary_epochs_var, width=8, command=self._set_dirty).grid(row=2, column=1, sticky='w', padx=8)
+		ttk.Spinbox(tab3, from_=1, to=10000, textvariable=self.primary_epochs_var, width=8, command=self._set_dirty).grid(row=3, column=1, sticky='w', padx=8)
 
-		ttk.Label(tab3, text='Secondary classifier').grid(row=3, column=0, sticky='w', padx=8, pady=(6,0))
+		ttk.Label(tab3, text='Secondary classifier').grid(row=4, column=0, sticky='w', padx=8, pady=(6,0))
 		self.secondary_classifier_var = tk.StringVar(value='yolo26n-cls.pt')
 		secondary_opts = [m.replace('.pt','-cls.pt') for m in CLASSIFIER_OPTIONS if m.startswith('yolo')]
-		ttk.Combobox(tab3, values=secondary_opts, textvariable=self.secondary_classifier_var).grid(row=3, column=1, sticky='w', padx=8)
+		ttk.Combobox(tab3, values=secondary_opts, textvariable=self.secondary_classifier_var).grid(row=4, column=1, sticky='w', padx=8)
 		self.secondary_classifier_var.trace_add('write', lambda *a: self._set_dirty())
 
-		ttk.Label(tab3, text='Secondary epochs').grid(row=4, column=0, sticky='w', padx=8, pady=(6,0))
+		ttk.Label(tab3, text='Secondary epochs').grid(row=5, column=0, sticky='w', padx=8, pady=(6,0))
 		self.secondary_epochs_var = tk.IntVar(value=100)
-		ttk.Spinbox(tab3, from_=1, to=10000, textvariable=self.secondary_epochs_var, width=8, command=self._set_dirty).grid(row=4, column=1, sticky='w', padx=8)
+		ttk.Spinbox(tab3, from_=1, to=10000, textvariable=self.secondary_epochs_var, width=8, command=self._set_dirty).grid(row=5, column=1, sticky='w', padx=8)
 
 		self.use_ncnn_var = tk.BooleanVar(value=False)
-		ttk.Checkbutton(tab3, text='use_ncnn', variable=self.use_ncnn_var, command=self._set_dirty).grid(row=5, column=0, sticky='w', padx=8, pady=(8,0))
+		ttk.Checkbutton(tab3, text='use_ncnn', variable=self.use_ncnn_var, command=self._set_dirty).grid(row=6, column=0, sticky='w', padx=8, pady=(8,0))
 
-		ttk.Label(tab3, text='Primary confidence thresh').grid(row=6, column=0, sticky='w', padx=8, pady=(6,0))
+		ttk.Label(tab3, text='Primary confidence thresh').grid(row=8, column=0, sticky='w', padx=8, pady=(6,0))
 		self.primary_conf_var = tk.DoubleVar(value=0.5)
-		ttk.Spinbox(tab3, from_=0.0, to=1.0, increment=0.01, textvariable=self.primary_conf_var, width=6, command=self._set_dirty).grid(row=6, column=1, sticky='w', padx=8)
+		ttk.Spinbox(tab3, from_=0.0, to=1.0, increment=0.01, textvariable=self.primary_conf_var, width=6, command=self._set_dirty).grid(row=8, column=1, sticky='w', padx=8)
 
-		ttk.Label(tab3, text='Secondary confidence thresh').grid(row=7, column=0, sticky='w', padx=8, pady=(6,0))
+		ttk.Label(tab3, text='Secondary confidence thresh').grid(row=9, column=0, sticky='w', padx=8, pady=(6,0))
 		self.secondary_conf_var = tk.DoubleVar(value=0.5)
-		ttk.Spinbox(tab3, from_=0.0, to=1.0, increment=0.01, textvariable=self.secondary_conf_var, width=6, command=self._set_dirty).grid(row=7, column=1, sticky='w', padx=8)
+		ttk.Spinbox(tab3, from_=0.0, to=1.0, increment=0.01, textvariable=self.secondary_conf_var, width=6, command=self._set_dirty).grid(row=9, column=1, sticky='w', padx=8)
 
-		ttk.Label(tab3, text='Dominant source').grid(row=8, column=0, sticky='w', padx=8, pady=(8,0))
-		self.dominant_source_var = tk.StringVar(value='confidence')
-		ttk.Combobox(tab3, values=['confidence', 'motion', 'static'], textvariable=self.dominant_source_var, state='readonly').grid(row=8, column=1, sticky='w', padx=8, pady=(8,0))
+		ttk.Label(tab3, text='Dominant source').grid(row=10, column=0, sticky='w', padx=8, pady=(8,0))
+		self.dominant_source_var = tk.StringVar(value='motion')
+		ttk.Combobox(tab3, values=['confidence', 'motion', 'static'], textvariable=self.dominant_source_var, state='readonly').grid(row=10, column=1, sticky='w', padx=8, pady=(8,0))
 		self.dominant_source_var.trace_add('write', lambda *a: self._set_dirty())
+
+		self._update_box_shape_dependent_widgets()
 
 
 		# TAB 4: Tracking
@@ -801,6 +913,10 @@ class SettingsEditorApp(tk.Tk):
 		}
 
 		# model type
+		box_shape_ini = d.get('box_shape', fallback='boxes')
+		self._loaded_box_shape = box_shape_ini
+		disambiguate_head_tail = self._str_to_bool(d.get('disambiguate_head_tail', fallback='false'))
+		self.box_shape_var.set(box_shape_choice_from_ini(box_shape_ini, disambiguate_head_tail))
 		self.val_frequency_var.set(float(d.get('val_frequency', fallback='0.2')))
 		self.primary_classifier_var.set(d.get('primary_classifier', fallback='yolo26n.pt'))
 		self.primary_epochs_var.set(int(d.get('primary_epochs', fallback='100')))
@@ -809,7 +925,8 @@ class SettingsEditorApp(tk.Tk):
 		self.use_ncnn_var.set(self._str_to_bool(d.get('use_ncnn', fallback='false')))
 		self.primary_conf_var.set(float(d.get('primary_conf_thresh', fallback='0.5')))
 		self.secondary_conf_var.set(float(d.get('secondary_conf_thresh', fallback='0.5')))
-		self.dominant_source_var.set(d.get('dominant_source', fallback='confidence'))
+		self.dominant_source_var.set(d.get('dominant_source', fallback='motion'))
+		self._update_box_shape_dependent_widgets()
 		
 
 		# tracking
@@ -1057,6 +1174,11 @@ class SettingsEditorApp(tk.Tk):
 				secondary_error + "\n\nPlease add more secondary classes before saving."
 			)
 			return
+
+		box_shape_warning = self._validate_box_shape_classifier()
+		if box_shape_warning and not messagebox.askyesno("Box shape / classifier mismatch",
+														   box_shape_warning + "\n\nSave anyway?"):
+			return
 	
 		# ---- build a fresh DEFAULT dict from the current GUI state ----
 		new_default = {}
@@ -1110,6 +1232,9 @@ class SettingsEditorApp(tk.Tk):
 		# ~ new_default['scale_factor'] = str(self.scale_factor_var.get())
 	
 		# model type
+		box_shape_ini, disambiguate_head_tail = box_shape_choice_to_ini(self.box_shape_var.get())
+		new_default['box_shape'] = box_shape_ini
+		new_default['disambiguate_head_tail'] = str(disambiguate_head_tail).lower()
 		new_default['primary_classifier'] = self.primary_classifier_var.get()
 		new_default['primary_epochs'] = str(self.primary_epochs_var.get())
 		new_default['secondary_classifier'] = self.secondary_classifier_var.get()
@@ -1168,6 +1293,15 @@ class SettingsEditorApp(tk.Tk):
 			# conservative: prompt if unsure
 			should_prompt_regen = True
 
+		# box_shape changes invalidate label *format* (not just training images), so this is
+		# handled separately from the motion-regen prompt above and takes priority over it.
+		should_prompt_box_shape_backup = False
+		try:
+			if self._box_shape_changed() and (self._has_existing_annotations() or self._has_existing_primary_models()):
+				should_prompt_box_shape_backup = True
+		except Exception:
+			should_prompt_box_shape_backup = True
+
 		# ---- atomically replace defaults and write file ----
 		try:
 			# Replace defaults atomically
@@ -1187,8 +1321,28 @@ class SettingsEditorApp(tk.Tk):
 				# _write_yaml_configs already shows a messagebox on failure; keep going.
 				pass			
 
+			# box_shape changes invalidate label format itself - handle this first, and skip the
+			# motion-regen prompt below if it fires (regeneration can't fix a format mismatch;
+			# backing up already forces the same "retrain from scratch" outcome).
+			if should_prompt_box_shape_backup:
+				ans = messagebox.askyesno(
+					"Box shape changed — back up existing annotations/models?",
+					("You changed the box shape, which changes the on-disk label format.\n"
+					 "Existing annotations and trained models are in the OLD format and are not\n"
+					 "compatible with the new one - they cannot simply be regenerated, they must be\n"
+					 "re-annotated from scratch. Do you want to back up the existing annotation and\n"
+					 "model directories now (renamed to *_backupN, not deleted)?")
+				)
+				if ans:
+					backed = self._backup_for_box_shape_change()
+					if backed:
+						print("Backed up directories for box_shape change:")
+						for b in backed:
+							print("  ", b)
+					else:
+						print("No annotation/model directories found to back up.")
 			# If we should prompt for regeneration, ask now (after save so regenerate uses new settings)
-			if should_prompt_regen:
+			elif should_prompt_regen:
 				ans = messagebox.askyesno(
 					"Settings changed — rebuild annotation dataset?",
 					("You have changed settings that affect how the annotation images are generated,\n"
@@ -1213,7 +1367,7 @@ class SettingsEditorApp(tk.Tk):
 						messagebox.showinfo("Regeneration finished", "Dataset regeneration finished successfully.")
 					else:
 						messagebox.showwarning("Regeneration failed or missing", msg)
-			
+
 			self.destroy()   # close the window on successful save
 	
 		except Exception as e:

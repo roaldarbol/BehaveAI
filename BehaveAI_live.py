@@ -14,6 +14,7 @@ from tkinter import ttk, messagebox, filedialog
 from collections import deque
 import platform
 import subprocess
+import box_geometry as bg
 
 
 
@@ -290,6 +291,12 @@ try:
 	measurement_noise = float(config['kalman'].get('measurement_noise','0.1'))
 	motion_threshold = -1 * int(config['DEFAULT'].get('motion_threshold','0'))
 
+	oriented = config['DEFAULT'].get('box_shape', 'boxes').lower() == 'oriented'
+	disambiguate_head_tail = oriented and config['DEFAULT'].get('disambiguate_head_tail', 'false').lower() == 'true'
+	static_ornt_base_dir = 'annot_static_ornt'
+	motion_ornt_base_dir = 'annot_motion_ornt'
+	detect_task = "obb" if oriented else "detect"
+
 except KeyError as e:
 	raise KeyError(f"Missing configuration parameter: {e}")
 
@@ -303,15 +310,7 @@ os.makedirs(output_folder, exist_ok=True)
 # -------------------------
 # Utilities
 # -------------------------
-def iou(box1, box2):
-	xa = max(box1[0], box2[0]); ya = max(box1[1], box2[1])
-	xb = min(box1[2], box2[2]); yb = min(box1[3], box2[3])
-	inter = max(0, xb-xa) * max(0, yb-ya)
-	area1 = (box1[2]-box1[0])*(box1[3]-box1[1]) if box1[2]>box1[0] and box1[3]>box1[1] else 0
-	area2 = (box2[2]-box2[0])*(box2[3]-box2[1]) if box2[2]>box2[0] and box2[3]>box2[1] else 0
-	prop1 = inter/area1 if area1>0 else 0
-	prop2 = inter/area2 if area2>0 else 0
-	return max(prop1, prop2)
+iou = bg.iou  # shared axis-aligned overlap-proportion helper (box_geometry.py)
 
 # -------------------------
 # Tracker
@@ -436,6 +435,8 @@ class CameraProcessor:
 		# secondary models keyed by PRIMARY class name (this matches train-time naming)
 		self.secondary_static_models = {}
 		self.secondary_motion_models = {}
+		self.ornt_static_models = {}
+		self.ornt_motion_models = {}
 
 		# frame buffers
 		self.prev_frames = None
@@ -469,14 +470,14 @@ class CameraProcessor:
 			if len(primary_static_classes) > 0 and os.path.exists(primary_static_model_path):
 				# ~ self.model_static = YOLO(primary_static_model_path)
 				if use_ncnn == 'true':
-					self.model_static = load_model_with_ncnn_preference(primary_static_model_path, "detect")
+					self.model_static = load_model_with_ncnn_preference(primary_static_model_path, detect_task)
 					print("Loaded primary static NCNN model")
 				else:
 					self.model_static = YOLO(primary_static_model_path)
 					print("Loaded primary static YOLO model")
 			if len(primary_motion_classes) > 0 and os.path.exists(primary_motion_model_path):
 				if use_ncnn == 'true':
-					self.model_motion = load_model_with_ncnn_preference(primary_motion_model_path, "detect")
+					self.model_motion = load_model_with_ncnn_preference(primary_motion_model_path, detect_task)
 					print("Loaded primary motion NCNN model")
 				else:
 					self.model_motion = YOLO(primary_motion_model_path)
@@ -523,6 +524,59 @@ class CameraProcessor:
 							print(f"Loaded secondary motion YOLO model for primary '{p}'")
 				except Exception as e:
 					print(f"Secondary motion model load failed for {p}: {e}")
+
+		# Load per-primary-class head/tail disambiguation classifiers (resolves the mod-180
+		# orientation ambiguity inherent to OBB detections - see box_geometry.crop_rotated_upright).
+		if disambiguate_head_tail:
+			for p in primary_classes:
+				try:
+					model_path = os.path.join(f"model_ornt_static_{p}", "train", "weights", "best.pt")
+					if os.path.exists(model_path):
+						if use_ncnn == 'true':
+							self.ornt_static_models[p] = load_model_with_ncnn_preference(model_path, "classify")
+						else:
+							self.ornt_static_models[p] = YOLO(model_path)
+				except Exception as e:
+					print(f"Head/tail static model load failed for {p}: {e}")
+				try:
+					model_path = os.path.join(f"model_ornt_motion_{p}", "train", "weights", "best.pt")
+					if os.path.exists(model_path):
+						if use_ncnn == 'true':
+							self.ornt_motion_models[p] = load_model_with_ncnn_preference(model_path, "classify")
+						else:
+							self.ornt_motion_models[p] = YOLO(model_path)
+				except Exception as e:
+					print(f"Head/tail motion model load failed for {p}: {e}")
+
+	def _orient_conf(self, model, img):
+		"""Probability the given whole crop is in the 'correct' (head-left, tail-right)
+		orientation, per the per-primary-class orientation classifier."""
+		if img is None or img.size == 0:
+			return 0.0
+		res = model.predict(img, verbose=False)
+		probs = res[0].probs
+		if probs is None:
+			return 0.0
+		correct_idx = None
+		for idx, name in model.names.items():
+			if name == 'correct':
+				correct_idx = idx
+				break
+		if correct_idx is None:
+			return 0.0
+		return float(probs.data[correct_idx])
+
+	def _disambiguate_head_tail(self, crop_img, head, tail, width, primary_class, is_motion):
+		"""Resolve both the mod-180 direction ambiguity AND which axis is actually the head-tail
+		axis (its longer dimension isn't necessarily the true head-tail axis - e.g. a wide-bodied
+		animal can be wider than it is long) using the whole-crop orientation classifier. Returns
+		(head, tail, width)."""
+		if not disambiguate_head_tail:
+			return head, tail, width
+		model = (self.ornt_motion_models if is_motion else self.ornt_static_models).get(primary_class)
+		if model is None:
+			return head, tail, width
+		return bg.best_head_tail_orientation(crop_img, head, tail, width, lambda img: self._orient_conf(model, img))
 
 	# ~ def set_camera(self, index):
 		# ~ with self.frame_lock:
@@ -746,13 +800,16 @@ class CameraProcessor:
 		csv_path = os.path.join(output_folder, f"det_{timestamp_session}.csv")
 		csv_file = open(csv_path, 'w', newline='')
 		csv_writer = csv.writer(csv_file)
-		csv_writer.writerow([
+		csv_header = [
 			"frame","id","x","y",
 			"primary_static_class","primary_static_conf",
 			"primary_motion_class","primary_motion_conf",
 			"secondary_static_class","secondary_static_conf",
 			"secondary_motion_class","secondary_motion_conf"
-		])
+		]
+		if oriented:
+			csv_header += ["angle_deg", "width", "length"]
+		csv_writer.writerow(csv_header)
 
 		prev_frames = None
 		frame_idx = 0
@@ -823,11 +880,24 @@ class CameraProcessor:
 				if primary_static_classes[0] != '0' and self.model_static is not None:
 					try:
 						results_static = self.model_static.predict(frame, conf=primary_conf_thresh, verbose=False)
-						for box in results_static[0].boxes:
-							x1,y1,x2,y2 = map(int, box.xyxy[0].tolist())
-							cls_idx = int(box.cls[0]); conf = float(box.conf[0])
-							class_name = primary_static_classes[cls_idx]
-							all_detections.append({'coords':(x1,y1,x2,y2),'primary_class':class_name,'primary_conf':conf,'source':'static'})
+						if oriented:
+							obb = results_static[0].obb
+							if obb is not None:
+								for obb_box in obb:
+									cls_idx = int(obb_box.cls[0]); conf = float(obb_box.conf[0])
+									class_name = primary_static_classes[cls_idx]
+									x1,y1,x2,y2 = map(int, obb_box.xyxy[0].tolist())
+									cx_, cy_, bw_, bh_, angle_ = [float(v) for v in obb_box.xywhr[0]]
+									head, tail, width = bg.head_tail_width_from_xywhr_rad(cx_, cy_, bw_, bh_, angle_)
+									head, tail, width = self._disambiguate_head_tail(frame, head, tail, width, class_name, is_motion=False)
+									all_detections.append({'coords':(x1,y1,x2,y2),'primary_class':class_name,'primary_conf':conf,'source':'static',
+															'head': head, 'tail': tail, 'width': width})
+						else:
+							for box in results_static[0].boxes:
+								x1,y1,x2,y2 = map(int, box.xyxy[0].tolist())
+								cls_idx = int(box.cls[0]); conf = float(box.conf[0])
+								class_name = primary_static_classes[cls_idx]
+								all_detections.append({'coords':(x1,y1,x2,y2),'primary_class':class_name,'primary_conf':conf,'source':'static'})
 					except Exception as e:
 						print("Static model inference error:", e)
 
@@ -835,42 +905,32 @@ class CameraProcessor:
 				if primary_motion_classes[0] != '0' and self.model_motion is not None:
 					try:
 						results_motion = self.model_motion.predict(motion_image, conf=primary_conf_thresh, verbose=False)
-						for box in results_motion[0].boxes:
-							x1,y1,x2,y2 = map(int, box.xyxy[0].tolist())
-							cls_idx = int(box.cls[0]); conf = float(box.conf[0])
-							class_name = primary_motion_classes[cls_idx]
-							all_detections.append({'coords':(x1,y1,x2,y2),'primary_class':class_name,'primary_conf':conf,'source':'motion'})
+						if oriented:
+							obb = results_motion[0].obb
+							if obb is not None:
+								for obb_box in obb:
+									cls_idx = int(obb_box.cls[0]); conf = float(obb_box.conf[0])
+									class_name = primary_motion_classes[cls_idx]
+									x1,y1,x2,y2 = map(int, obb_box.xyxy[0].tolist())
+									cx_, cy_, bw_, bh_, angle_ = [float(v) for v in obb_box.xywhr[0]]
+									head, tail, width = bg.head_tail_width_from_xywhr_rad(cx_, cy_, bw_, bh_, angle_)
+									head, tail, width = self._disambiguate_head_tail(motion_image, head, tail, width, class_name, is_motion=True)
+									all_detections.append({'coords':(x1,y1,x2,y2),'primary_class':class_name,'primary_conf':conf,'source':'motion',
+															'head': head, 'tail': tail, 'width': width})
+						else:
+							for box in results_motion[0].boxes:
+								x1,y1,x2,y2 = map(int, box.xyxy[0].tolist())
+								cls_idx = int(box.cls[0]); conf = float(box.conf[0])
+								class_name = primary_motion_classes[cls_idx]
+								all_detections.append({'coords':(x1,y1,x2,y2),'primary_class':class_name,'primary_conf':conf,'source':'motion'})
 					except Exception as e:
 						print("Motion model inference error:", e)
 
-			# Merge detections between static and motion (same logic)
-			merged_detections = []
-			for det in all_detections:
-				x1,y1,x2,y2 = det['coords']; cx,cy = (x1+x2)//2, (y1+y2)//2
-				matched = False
-				for md in merged_detections:
-					md_cx, md_cy = md['centroid']; dist = np.hypot(cx-md_cx, cy-md_cy)
-					md_x1, md_y1, md_x2, md_y2 = md['coords']; overlap = iou((x1,y1,x2,y2),(md_x1,md_y1,md_x2,md_y2))
-					ms_source = md.get('source','')
-					if dist < centroid_merge_thresh or overlap > iou_thresh:
-						# decide which to prefer based on dominant_source or confidence
-						if det['source'] == ms_source or dominant_source == 'confidence':
-							if det['primary_conf'] > md.get('primary_conf',0):
-								md['primary_class_combined'] = md.get('primary_class','')
-								md['primary_conf_combined'] = md.get('primary_conf',0)
-								md['primary_class'] = det['primary_class']
-								md['primary_conf'] = det['primary_conf']
-								md['coords'] = det['coords']; md['centroid'] = (cx,cy); md['source'] = det['source']
-						elif det['source'] == 'static' and dominant_source == 'static':
-							md['primary_class_combined'] = md.get('primary_class',''); md['primary_conf_combined'] = md.get('primary_conf',0)
-							md['primary_class'] = det['primary_class']; md['primary_conf'] = det['primary_conf']; md['coords'] = det['coords']; md['centroid'] = (cx,cy); md['source'] = det['source']
-						elif det['source'] == 'motion' and dominant_source == 'motion':
-							md['primary_class_combined'] = md.get('primary_class',''); md['primary_conf_combined'] = md.get('primary_conf',0)
-							md['primary_class'] = det['primary_class']; md['primary_conf'] = det['primary_conf']; md['coords'] = det['coords']; md['centroid'] = (cx,cy); md['source'] = det['source']
-						matched = True; break
-				if not matched:
-					new_det = {'coords':det['coords'],'centroid':(cx,cy),'source':det['source'],'primary_class':det['primary_class'],'primary_conf':det['primary_conf'],'primary_class_combined':'','primary_conf_combined':0.0}
-					merged_detections.append(new_det)
+			# Merge detections from the static/motion streams into one per physical object,
+			# respecting dominant_source - shared with BehaveAI_classify_track.py and the
+			# annotation tool's auto-annotate so the rule behaves identically everywhere
+			# (box_geometry.py)
+			merged_detections = bg.merge_source_detections(all_detections, centroid_merge_thresh, iou_thresh, dominant_source)
 
 			# Secondary classification, tracking and drawing
 			processed_detections = []
@@ -906,12 +966,17 @@ class CameraProcessor:
 							crop_img = frame
 
 					# Safe crop bounds
-					h_img, w_img = (crop_img.shape[:2] if crop_img is not None else (0,0))
-					x1c = max(0, min(w_img-1, int(x1))); x2c = max(0, min(w_img-1, int(x2)))
-					y1c = max(0, min(h_img-1, int(y1))); y2c = max(0, min(h_img-1, int(y2)))
 					crop = None
-					if crop_img is not None and x2c > x1c and y2c > y1c:
-						crop = crop_img[y1c:y2c, x1c:x2c]
+					if oriented and det.get('head') is not None:
+						if crop_img is not None:
+							corners = bg.corners_from_head_tail_width(det['head'], det['tail'], det['width'])
+							crop = bg.crop_black_masked(crop_img, corners)
+					else:
+						h_img, w_img = (crop_img.shape[:2] if crop_img is not None else (0,0))
+						x1c = max(0, min(w_img-1, int(x1))); x2c = max(0, min(w_img-1, int(x2)))
+						y1c = max(0, min(h_img-1, int(y1))); y2c = max(0, min(h_img-1, int(y2)))
+						if crop_img is not None and x2c > x1c and y2c > y1c:
+							crop = crop_img[y1c:y2c, x1c:x2c]
 
 					secondary_class = primary_class; secondary_conf = 1.0
 					if sec_model and crop is not None and crop.size > 0:
@@ -953,35 +1018,60 @@ class CameraProcessor:
 				primary_cls = ps_class if p_source=='static' else pm_class
 				primary_col = primary_colors[primary_classes.index(primary_cls)] if primary_cls in primary_classes else (0,255,0)
 				secondary_col = (255,255,255)
-				if hierarchical_mode:
-					secondary_cls = ''
-					if sm_class and sm_class != primary_cls:
-						secondary_cls = sm_class; secondary_col = secondary_colors[secondary_classes.index(secondary_cls)]
-					if ss_class and ss_class != primary_cls:
-						secondary_cls = ss_class; secondary_col = secondary_colors[secondary_classes.index(secondary_cls)]
-					if primary_cls in ignore_secondary:
-						label = f"{tid} {primary_cls.upper()}"
+				if oriented and det.get('head') is not None:
+					corners = bg.corners_from_head_tail_width(det['head'], det['tail'], det['width'])
+					if hierarchical_mode:
+						secondary_cls = ''
+						if sm_class and sm_class != primary_cls:
+							secondary_cls = sm_class; secondary_col = secondary_colors[secondary_classes.index(secondary_cls)]
+						if ss_class and ss_class != primary_cls:
+							secondary_cls = ss_class; secondary_col = secondary_colors[secondary_classes.index(secondary_cls)]
+						if primary_cls in ignore_secondary:
+							label = f"{tid} {primary_cls.upper()}"
+							bg.draw_oriented_box(frame, corners, det['head'], primary_col, thickness=line_thickness, label=label, label_color=primary_col)
+						else:
+							outer_th = line_thickness + 2
+							outer_corners = bg.inset_corners(corners, -outer_th)
+							cv2.polylines(frame, [np.array(outer_corners, dtype=np.int32)], True, primary_col, outer_th, cv2.LINE_AA)
+							# Secondary box is nudged outward and drawn a shade thicker than a bare
+							# line_thickness so it isn't visually swallowed by the thicker primary ring.
+							inner_th = line_thickness + 1
+							inner_corners = bg.inset_corners(corners, -1)
+							label = [(f"{tid} {primary_cls.upper()} ", primary_col), (secondary_cls, secondary_col)]
+							bg.draw_oriented_box(frame, inner_corners, det['head'], secondary_col, thickness=inner_th, label=label)
+					else:
+						label = f"{tid} {primary_cls}"
+						bg.draw_oriented_box(frame, corners, det['head'], primary_col, thickness=line_thickness, label=label, label_color=primary_col)
+				else:
+					if hierarchical_mode:
+						secondary_cls = ''
+						if sm_class and sm_class != primary_cls:
+							secondary_cls = sm_class; secondary_col = secondary_colors[secondary_classes.index(secondary_cls)]
+						if ss_class and ss_class != primary_cls:
+							secondary_cls = ss_class; secondary_col = secondary_colors[secondary_classes.index(secondary_cls)]
+						if primary_cls in ignore_secondary:
+							label = f"{tid} {primary_cls.upper()}"
+							label_size,_ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_size, line_thickness)
+							lw,lh = label_size
+							cv2.rectangle(frame, (x1-line_thickness, y1 - lh - line_thickness*4), (x1 + lw + line_thickness*2, y1), (0,0,0), -1)
+							cv2.rectangle(frame, (x1,y1), (x2,y2), primary_col, line_thickness)
+							cv2.putText(frame, label, (x1, y1 - line_thickness*2), cv2.FONT_HERSHEY_SIMPLEX, font_size, primary_col, line_thickness, cv2.LINE_AA)
+						else:
+							outer_t = line_thickness + 2
+							cv2.rectangle(frame, (x1-outer_t, y1-outer_t), (x2+outer_t, y2+outer_t), primary_col, outer_t)
+							# Secondary box is nudged outward and drawn a shade thicker than a bare
+							# line_thickness so it isn't visually swallowed by the thicker primary ring.
+							inner_t = line_thickness + 1
+							cv2.rectangle(frame, (x1-1, y1-1), (x2+1, y2+1), secondary_col, inner_t)
+							bg.draw_label_with_background(frame, [(f"{tid} {primary_cls.upper()} ", primary_col), (secondary_cls, secondary_col)],
+														   x1, y1, font_size, line_thickness)
+					else:
+						label = f"{tid} {primary_cls}"
 						label_size,_ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_size, line_thickness)
 						lw,lh = label_size
 						cv2.rectangle(frame, (x1-line_thickness, y1 - lh - line_thickness*4), (x1 + lw + line_thickness*2, y1), (0,0,0), -1)
 						cv2.rectangle(frame, (x1,y1), (x2,y2), primary_col, line_thickness)
-						cv2.putText(frame, label, (x1, y1 - line_thickness*2), cv2.FONT_HERSHEY_SIMPLEX, font_size, primary_col, line_thickness, cv2.LINE_AA)
-					else:
-						outer_t = line_thickness + 2
-						cv2.rectangle(frame, (x1-outer_t, y1-outer_t), (x2+outer_t, y2+outer_t), primary_col, outer_t)
-						label = f"{tid} {primary_cls.upper()} {secondary_cls}"
-						label_size,_ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_size, line_thickness)
-						lw,lh = label_size
-						cv2.rectangle(frame, (x1-line_thickness, y1 - lh - line_thickness*4), (x1 + lw + line_thickness*2, y1), (0,0,0), -1)
-						cv2.rectangle(frame, (x1,y1), (x2,y2), secondary_col, line_thickness)
-						cv2.putText(frame, label, (x1, y1 - line_thickness*2), cv2.FONT_HERSHEY_SIMPLEX, font_size, secondary_col, line_thickness, cv2.LINE_AA)
-				else:
-					label = f"{tid} {primary_cls}"
-					label_size,_ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_size, line_thickness)
-					lw,lh = label_size
-					cv2.rectangle(frame, (x1-line_thickness, y1 - lh - line_thickness*4), (x1 + lw + line_thickness*2, y1), (0,0,0), -1)
-					cv2.rectangle(frame, (x1,y1), (x2,y2), primary_col, line_thickness)
-					cv2.putText(frame, label, (x1, y1 - line_thickness*3), cv2.FONT_HERSHEY_SIMPLEX, font_size, primary_col, line_thickness, cv2.LINE_AA)
+						cv2.putText(frame, label, (x1, y1 - line_thickness*3), cv2.FONT_HERSHEY_SIMPLEX, font_size, primary_col, line_thickness, cv2.LINE_AA)
 
 				# draw track state vectors
 				if tid in self.tracker.tracks:
@@ -999,13 +1089,20 @@ class CameraProcessor:
 				# The CSV file remains the same single session file, but we only append rows
 				# when the GUI's detection-recording option is on.
 				if self.detection_recording_enabled:
-					csv_writer.writerow([
+					csv_row = [
 						frame_idx, tid, cx, cy,
 						ps_class, f"{ps_conf:.3f}",
 						pm_class, f"{pm_conf:.3f}",
 						ss_class, f"{ss_conf:.3f}",
 						sm_class, f"{sm_conf:.3f}"
-					])
+					]
+					if oriented:
+						if det.get('head') is not None:
+							angle_deg, length = bg.angle_length_from_head_tail(det['head'], det['tail'])
+							csv_row += [f"{angle_deg:.2f}", f"{det['width']:.2f}", f"{length:.2f}"]
+						else:
+							csv_row += ['', '', '']
+					csv_writer.writerow(csv_row)
 				
 
 

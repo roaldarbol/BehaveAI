@@ -21,6 +21,7 @@ import glob
 import sys
 import time
 from collections import deque
+import box_geometry as bg
 
 # optional GUI prompt if INI not supplied
 try:
@@ -72,6 +73,15 @@ def load_config(config_path):
 		params['motion_blocks_static'] = config['DEFAULT'].get('motion_blocks_static', 'false').lower()
 		params['static_blocks_motion'] = config['DEFAULT'].get('static_blocks_motion', 'false').lower()
 		params['save_empty_frames'] = config['DEFAULT'].get('save_empty_frames', 'false').lower()
+		params['oriented'] = config['DEFAULT'].get('box_shape', 'boxes').lower() == 'oriented'
+
+		# class name lists, needed only to map a label file's class index back to the primary
+		# class name (for locating/regenerating that class's secondary-crop and orientation
+		# datasets) - '0' is the sentinel for "this stream is disabled" (see CLAUDE.md conventions)
+		static_classes = [c.strip() for c in config['DEFAULT'].get('primary_static_classes', '0').split(',')]
+		motion_classes = [c.strip() for c in config['DEFAULT'].get('primary_motion_classes', '0').split(',')]
+		params['primary_static_classes'] = [] if (not static_classes or static_classes[0] == '0') else static_classes
+		params['primary_motion_classes'] = [] if (not motion_classes or motion_classes[0] == '0') else motion_classes
 
 		# Compute base frame window size (number of sampled frames)
 		base_window = 4
@@ -232,32 +242,149 @@ def apply_grey_boxes(image, boxes):
 	return result
 
 
-def apply_blocking_boxes(image, boxes):
+def apply_blocking_boxes(image, boxes, oriented=False):
+	"""Grey-fill regions from the *other* stream's boxes so it doesn't contaminate this
+	stream's training image. Oriented boxes are polygon-filled (cuts the corners, consistent
+	with the black-masked secondary crops elsewhere); axis-aligned boxes fill their rectangle."""
 	result = image.copy()
-	for (x1, y1, x2, y2) in boxes:
-		cv2.rectangle(result, (x1, y1), (x2, y2), (128, 128, 128), -1)
+	if oriented:
+		for corners in boxes:
+			cv2.fillPoly(result, [np.array(corners, dtype=np.int32)], (128, 128, 128))
+	else:
+		for (x1, y1, x2, y2) in boxes:
+			cv2.rectangle(result, (x1, y1), (x2, y2), (128, 128, 128), -1)
 	return result
 
 
-def get_blocking_boxes(label_path, img_w, img_h):
+def get_blocking_boxes(label_path, img_w, img_h, oriented=False):
+	"""Return either axis-aligned (x1,y1,x2,y2) tuples or lists of 4 (x,y) pixel corners,
+	depending on the project's box_shape."""
 	boxes = []
-	if os.path.exists(label_path):
-		with open(label_path, 'r') as f:
-			for line in f:
-				parts = line.split()
-				if len(parts) < 5:
-					continue
-				try:
-					xc = float(parts[1]); yc = float(parts[2])
-					w = float(parts[3]); h = float(parts[4])
-				except Exception:
-					continue
-				x1 = int((xc - w/2) * img_w)
-				y1 = int((yc - h/2) * img_h)
-				x2 = int((xc + w/2) * img_w)
-				y2 = int((yc + h/2) * img_h)
+	if not os.path.exists(label_path):
+		return boxes
+	with open(label_path, 'r') as f:
+		for line in f:
+			parsed = bg.read_label_line(line, oriented)
+			if parsed is None:
+				continue
+			if oriented:
+				boxes.append(bg.denorm_corners(parsed['corners_n'], img_w, img_h))
+			else:
+				x1, y1, x2, y2 = bg.denorm_axis(parsed['xc'], parsed['yc'], parsed['bw'], parsed['bh'], img_w, img_h)
 				boxes.append((x1, y1, x2, y2))
 	return boxes
+
+
+def read_boxes_with_class(label_path, cls_offset, img_w, img_h, oriented):
+	"""Read a primary label file back into pixel-space boxes, offsetting motion-stream class
+	indices back into the combined primary_classes index space (mirrors how the annotator
+	subtracts len(primary_static_classes) when writing motion labels, in reverse)."""
+	boxes = []
+	if not os.path.exists(label_path):
+		return boxes
+	with open(label_path, 'r') as f:
+		for line in f:
+			parsed = bg.read_label_line(line, oriented)
+			if parsed is None:
+				continue
+			box = {'cls': parsed['cls'] + cls_offset}
+			if oriented:
+				box['corners'] = bg.denorm_corners(parsed['corners_n'], img_w, img_h)
+			else:
+				box['coords'] = bg.denorm_axis(parsed['xc'], parsed['yc'], parsed['bw'], parsed['bh'], img_w, img_h)
+			boxes.append(box)
+	return boxes
+
+
+def find_matching_crop(class_dir, video_label, frame_num, x1, y1, tol=3):
+	"""Find an existing secondary-crop file for this box under class_dir/<secondary_class>/,
+	matched by its embedded x1,y1 (tolerant of the odd 1px rounding difference that can occur
+	reconstructing pixel coords from a label file's normalized floats, vs. the raw ints used at
+	annotation-save time). Returns (secondary_class_name, path), or (None, None) if no match -
+	which just means this box was never assigned a secondary class (or hierarchical mode was off
+	when it was annotated)."""
+	pattern = os.path.join(class_dir, '*', f"{video_label}_{frame_num}_*_*.jpg")
+	best, best_dist = None, None
+	for path in glob.glob(pattern):
+		stem = os.path.splitext(os.path.basename(path))[0]
+		parts = stem.split('_')
+		try:
+			fy1, fx1 = int(parts[-1]), int(parts[-2])
+		except ValueError:
+			continue
+		dist = abs(fx1 - x1) + abs(fy1 - y1)
+		if dist <= tol and (best_dist is None or dist < best_dist):
+			best_dist = dist
+			best = (os.path.basename(os.path.dirname(path)), path)
+	return best if best else (None, None)
+
+
+def regenerate_crops_for_frame(video_label, frame_num, img_w, img_h, static_label_path, motion_label_path,
+								static_final, motion_final, params):
+	"""Regenerate the secondary-classifier crop datasets (annot_static_crop/annot_motion_crop) and,
+	for oriented projects, the head/tail orientation datasets (annot_static_ornt/annot_motion_ornt),
+	so they stay in lockstep with the regenerated primary images. A box's secondary-class
+	assignment isn't stored in the primary label file, so it's recovered by matching the box's
+	regenerated pixel position against whichever existing crop file it corresponds to on disk -
+	only crops that already exist get overwritten; none are newly created here."""
+	oriented = params['oriented']
+	static_classes = params['primary_static_classes']
+	motion_classes = params['primary_motion_classes']
+	primary_classes = static_classes + motion_classes
+
+	boxes = read_boxes_with_class(static_label_path, 0, img_w, img_h, oriented)
+	boxes += read_boxes_with_class(motion_label_path, len(static_classes), img_w, img_h, oriented)
+
+	for box in boxes:
+		if box['cls'] >= len(primary_classes):
+			continue
+		primary_class_name = primary_classes[box['cls']]
+
+		if oriented:
+			corners = box['corners']
+			x1, y1, _, _ = bg.axis_aligned_bounds(corners)
+		else:
+			x1, y1, x2, y2 = box['coords']
+
+		# --- secondary hierarchical crops ---
+		for crop_root, ann_frame in (('annot_static_crop', static_final), ('annot_motion_crop', motion_final)):
+			if ann_frame is None:
+				continue
+			class_dir = os.path.join(crop_root, primary_class_name)
+			if not os.path.isdir(class_dir):
+				continue
+			secondary_class_name, existing_path = find_matching_crop(class_dir, video_label, frame_num, x1, y1)
+			if existing_path is None:
+				continue
+			if oriented:
+				crop = bg.crop_black_masked(ann_frame, corners)
+			else:
+				crop = ann_frame[y1:y2, x1:x2]
+			if crop is None or crop.size == 0:
+				continue
+			cv2.imwrite(existing_path, crop)
+			print(f"  Regenerated secondary crop ({crop_root}/{primary_class_name}/{secondary_class_name}): {os.path.basename(existing_path)}")
+
+		# --- orientation ('correct'/'null') crops, oriented projects only ---
+		if oriented:
+			head, tail, width = bg.head_tail_width_from_corners(corners)
+			for ornt_root, ann_frame in (('annot_static_ornt', static_final), ('annot_motion_ornt', motion_final)):
+				if ann_frame is None:
+					continue
+				class_dir = os.path.join(ornt_root, primary_class_name)
+				correct_path = os.path.join(class_dir, 'correct', f"{video_label}_{frame_num}.jpg")
+				if not os.path.exists(correct_path):
+					continue
+				upright = bg.crop_rotated_upright(ann_frame, head, tail, width)
+				if upright is None or upright.size == 0:
+					continue
+				cv2.imwrite(correct_path, upright)
+				null_dir = os.path.join(class_dir, 'null')
+				for i, rotated in enumerate(bg.rotate_90_variants(upright)):
+					null_path = os.path.join(null_dir, f"{video_label}_{frame_num}_{i}.jpg")
+					if os.path.exists(null_path):
+						cv2.imwrite(null_path, rotated)
+				print(f"  Regenerated orientation crops ({ornt_root}/{primary_class_name}): {video_label}_{frame_num}")
 
 
 # -----------------------
@@ -298,6 +425,10 @@ def regenerate_annotations(config_path):
 
 	# extensions to search for video files
 	exts = ['.mp4', '.avi', '.mov', '.mkv', '.MP4', '.AVI', '.MOV', '.MKV']
+
+	# a given (base_name, split) can appear twice in base_names (once via annot_motion/labels,
+	# once via annot_static/labels) - crop/orientation regeneration only needs to run once per frame
+	processed_crop_frames = set()
 
 	# process each unique frame
 	for base_name, split, base_dir in sorted(base_names):
@@ -340,6 +471,23 @@ def regenerate_annotations(config_path):
 		static_label_path = os.path.join('annot_static', 'labels', split, f"{base_name}.txt")
 		motion_label_path = os.path.join('annot_motion', 'labels', split, f"{base_name}.txt")
 
+		# Build the grey/blocking-applied "final" images unconditionally (cheap - just copies plus
+		# box drawing) so they're available below for crop/orientation regeneration regardless of
+		# which label dir (base_dir) triggered this iteration.
+		static_final = None
+		if static_img is not None:
+			static_final = apply_grey_boxes(static_img.copy(), static_mask_boxes)
+			if params.get('motion_blocks_static', 'false') == 'true':
+				static_block_boxes = get_blocking_boxes(motion_label_path, img_w, img_h, oriented=params['oriented'])
+				static_final = apply_blocking_boxes(static_final, static_block_boxes, oriented=params['oriented'])
+
+		motion_final = None
+		if motion_img is not None:
+			motion_final = apply_grey_boxes(motion_img.copy(), motion_mask_boxes)
+			if params.get('static_blocks_motion', 'false') == 'true':
+				static_boxes_for_block = get_blocking_boxes(static_label_path, img_w, img_h, oriented=params['oriented'])
+				motion_final = apply_blocking_boxes(motion_final, static_boxes_for_block, oriented=params['oriented'])
+
 		# -----------------------
 		# Process static images (save into annot_static/images/<split>/)
 		# -----------------------
@@ -347,20 +495,9 @@ def regenerate_annotations(config_path):
 		#  - the entry came from annot_static (base_dir == 'annot_static'), OR
 		#  - save_empty_frames == 'true' (keep parity with motion logic)
 		if base_dir == 'annot_static' or params['save_empty_frames'] == 'true':
-			if static_img is None:
+			if static_final is None:
 				print(f"  No static image for {base_name}")
 			else:
-				static_final = static_img.copy()
-
-				# Apply grey boxes defined for static
-				static_final = apply_grey_boxes(static_final, static_mask_boxes)
-
-				# If motion_blocks_static enabled, block regions where motion labels exist
-				if params.get('motion_blocks_static', 'false') == 'true':
-					# blocking boxes come from motion labels (if present)
-					static_block_boxes = get_blocking_boxes(motion_label_path, img_w, img_h)
-					static_final = apply_blocking_boxes(static_final, static_block_boxes)
-
 				static_img_path = os.path.join('annot_static', 'images', split, f"{base_name}.jpg")
 				os.makedirs(os.path.dirname(static_img_path), exist_ok=True)
 				cv2.imwrite(static_img_path, static_final)
@@ -372,23 +509,22 @@ def regenerate_annotations(config_path):
 		# Keep original behaviour: regenerate motion when entry came from annot_motion
 		# or when save_empty_frames is enabled.
 		if base_dir == 'annot_motion' or params['save_empty_frames'] == 'true':
-			if motion_img is None:
+			if motion_final is None:
 				print(f"  No motion image for {base_name}")
 			else:
-				motion_final = motion_img.copy()
-
-				# Apply grey boxes defined for motion
-				motion_final = apply_grey_boxes(motion_final, motion_mask_boxes)
-
-				# Apply static blocking if enabled (static annotations can block motion image)
-				if params.get('static_blocks_motion', 'false') == 'true':
-					static_boxes = get_blocking_boxes(static_label_path, img_w, img_h)
-					motion_final = apply_blocking_boxes(motion_final, static_boxes)
-
 				motion_img_path = os.path.join('annot_motion', 'images', split, f"{base_name}.jpg")
 				os.makedirs(os.path.dirname(motion_img_path), exist_ok=True)
 				cv2.imwrite(motion_img_path, motion_final)
 				print(f"Regenerated motion: {motion_img_path}")
+
+		# -----------------------
+		# Process secondary-crop and orientation-crop datasets (once per unique frame)
+		# -----------------------
+		crop_key = (base_name, split)
+		if crop_key not in processed_crop_frames and (static_final is not None or motion_final is not None):
+			processed_crop_frames.add(crop_key)
+			regenerate_crops_for_frame(video_name, frame_num, img_w, img_h, static_label_path, motion_label_path,
+										static_final, motion_final, params)
 
 	print("Regeneration loop complete.")
 
