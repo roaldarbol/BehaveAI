@@ -1,5 +1,6 @@
 <img width="400" height="69" alt="BehaveAI_400" src="https://github.com/user-attachments/assets/6fb5cd16-d266-4e8b-9513-1734a45813bf" />
 
+This is the original repo for BehaveAI (https://github.com/troscianko/BehaveAI)
 
 # A framework for detecting, classifying and tracking moving objects
 
